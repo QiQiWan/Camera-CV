@@ -1,0 +1,36 @@
+{
+  "bridge_day": {
+    "display_name": "桥梁白天场景",
+    "model_stem": "bridge_day",
+    "enable_realtime_segmentation": true,
+    "realtime_detection_interval": 5,
+    "min_component_area": 32,
+    "mask_morph_kernel": 3,
+    "mask_close_iterations": 1,
+    "min_crack_width_px": 1.2,
+    "camera_horizontal_fov_deg": 58.0,
+    "measurement_mode": "hybrid_average",
+    "laser_enabled": true,
+    "laser_baudrate": 9600,
+    "laser_unit": "m",
+    "laser_distance_offset_mm": 25.0,
+    "laser_parser_regex": "(\\d+(?:\\.\\d+)?)"
+  },
+  "tunnel_night": {
+    "display_name": "隧道夜间场景",
+    "model_stem": "tunnel_night",
+    "enable_realtime_segmentation": true,
+    "realtime_detection_interval": 8,
+    "min_component_area": 20,
+    "mask_morph_kernel": 5,
+    "mask_close_iterations": 2,
+    "min_crack_width_px": 0.8,
+    "camera_horizontal_fov_deg": 62.0,
+    "measurement_mode": "laser_first",
+    "laser_enabled": true,
+    "laser_baudrate": 115200,
+    "laser_unit": "m",
+    "laser_distance_offset_mm": 15.0,
+    "laser_parser_regex": "(\\d+(?:\\.\\d+)?)"
+  }
+}
