@@ -186,6 +186,11 @@ class RealtimeProcessingMixin:
         self.fps_status_label.setText(
             f"FPS：工业A 抓取 {self.current_camera_a_grab_fps:.1f} / 显示 {self.current_camera_a_display_fps:.1f} | 预览 {self.current_preview_fps:.1f} | 显示 {self.current_display_fps:.1f} | 推理 {self.current_inference_fps:.1f} | 上限 {cap_text} | {motion_text} | {patrol_text}"
         )
+        try:
+            if hasattr(self, 'refresh_runtime_strip'):
+                self.refresh_runtime_strip()
+        except Exception:
+            pass
 
 
     def estimate_motion_score(self, frame):

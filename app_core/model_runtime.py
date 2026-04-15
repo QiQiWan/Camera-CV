@@ -312,7 +312,7 @@ class ModelRuntimeMixin:
             self.match_preview_model_to_segmentation()
 
 
-    def update_model_status_label(self, message=''):
+    def _build_model_status_summary(self, message=''):
         seg_name = Path(self.onnx_model_path).name if self.onnx_model_path else '未加载'
         preview_name = Path(self.yolo_model_path).name if self.yolo_model_path else '无'
         scene_name = Path(self.config.active_scene_profile).name if getattr(self.config, 'active_scene_profile', '') else '无'
@@ -328,12 +328,60 @@ class ModelRuntimeMixin:
         debug_line = self._format_last_inference_debug_line()
         if debug_line:
             summary += f'\n{debug_line}'
+        return summary
+
+
+    def _apply_model_status_text(self, message=''):
+        summary = self._build_model_status_summary(message)
+        if summary == getattr(self, '_last_model_status_rendered', ''):
+            return
+        self._last_model_status_rendered = summary
         self.model_status_label.setText(summary)
         try:
+            if message and hasattr(self, 'append_runtime_event'):
+                lower_msg = str(message).lower()
+                level = 'info'
+                if any(token in lower_msg for token in ['失败', '错误', '异常', '未检测', '无法', 'empty']):
+                    level = 'danger'
+                elif any(token in lower_msg for token in ['警告', '回退', 'fallback', 'cpu']):
+                    level = 'warn'
+                elif any(token in lower_msg for token in ['成功', '完成', '已加载', '已连接', '已更新', '已应用']):
+                    level = 'ok'
+                self.append_runtime_event(message, level=level)
             if hasattr(self, 'refresh_config_summary'):
                 self.refresh_config_summary()
+            if hasattr(self, 'refresh_runtime_strip'):
+                self.refresh_runtime_strip()
         except Exception:
             pass
+
+
+    def _flush_pending_model_status_label(self):
+        message = getattr(self, '_pending_model_status_message', None)
+        self._pending_model_status_message = None
+        if message is None:
+            return
+        self._last_model_status_update_ts = time.perf_counter()
+        self._apply_model_status_text(message)
+
+
+    def update_model_status_label(self, message=''):
+        message = str(message or '')
+        is_realtime_message = message.startswith('实时检测:')
+        min_interval_ms = max(40, int(getattr(self.config, 'ui_status_update_min_interval_ms', 120) or 120))
+        now = time.perf_counter()
+        if is_realtime_message and hasattr(self, 'model_status_debounce_timer'):
+            elapsed_ms = (now - float(getattr(self, '_last_model_status_update_ts', 0.0))) * 1000.0
+            if elapsed_ms < min_interval_ms:
+                self._pending_model_status_message = message
+                remain_ms = max(10, int(round(min_interval_ms - elapsed_ms)))
+                try:
+                    self.model_status_debounce_timer.start(remain_ms)
+                except Exception:
+                    pass
+                return
+        self._last_model_status_update_ts = now
+        self._apply_model_status_text(message)
 
 
     def _set_last_inference_debug(self, info=None):
@@ -1289,6 +1337,17 @@ class ModelRuntimeMixin:
             meta_filename = os.path.join(self.filepath, f'{Path(picture_name).stem}_meta.json')
             with open(meta_filename, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
+        try:
+            self.last_saved_artifacts = {
+                'source': source_label,
+                'original': org_filename,
+                'result': out_filename,
+                'saved_at': datetime.now().strftime('%H:%M:%S'),
+            }
+            if hasattr(self, 'refresh_runtime_strip'):
+                self.refresh_runtime_strip()
+        except Exception:
+            pass
         return org_filename, out_filename
 
 

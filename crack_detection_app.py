@@ -4,6 +4,7 @@ import os
 import sys
 import ctypes
 import threading
+from dataclasses import asdict
 import time
 import json
 import re
@@ -11,13 +12,15 @@ import concurrent.futures
 import numpy as np
 from pathlib import Path
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime
 
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QGroupBox, QDialog, QFileDialog, QMenu,
                                QLabel, QPushButton, QComboBox, QMessageBox, QRadioButton, QLineEdit, QSlider, QSpinBox, QInputDialog, QCheckBox,
-                               QScrollArea, QSplitter, QSizePolicy, QTabWidget, QStackedWidget, QDialogButtonBox, QFrame, QLayout)
-from PySide6.QtGui import QPixmap, QIcon, QImage, QPainter, QPen, QColor, QAction
-from PySide6.QtCore import Qt, QTimer, QPoint, QSize
+                               QScrollArea, QSplitter, QSizePolicy, QTabWidget, QStackedWidget, QDialogButtonBox, QFrame, QLayout,
+                               QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QTextEdit, QListWidget, QListWidgetItem)
+from PySide6.QtGui import QPixmap, QIcon, QImage, QPainter, QPen, QColor, QAction, QDesktopServices, QShortcut, QKeySequence
+from PySide6.QtCore import Qt, QTimer, QPoint, QSize, QUrl
 from driver import usb_camera_driver
 from driver import daily_logger
 from app_core.shared import APP_VERSION, MainThreadExecutor, SystemConfig, DetectionResult, resolve_first_existing_path
@@ -230,15 +233,114 @@ class ZoomImageDialog(QDialog):
 
 
 
+class CameraSearchDiagnosticDialog(QDialog):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self.setModal(False)
+        self.setWindowTitle('普通相机 B 设备诊断')
+        self.resize(920, 620)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.summary_label = QLabel('点击“开始诊断”以扫描本机视频设备索引和后端。')
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet('padding:8px 10px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
+        layout.addWidget(self.summary_label)
+
+        toolbar = QHBoxLayout()
+        self.start_btn = QPushButton('🩺 开始诊断')
+        self.copy_btn = QPushButton('📋 复制报告')
+        self.close_btn = QPushButton('关闭')
+        self.copy_btn.setEnabled(False)
+        toolbar.addWidget(self.start_btn)
+        toolbar.addWidget(self.copy_btn)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.close_btn)
+        layout.addLayout(toolbar)
+
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(['索引', '后端', '状态', '是否有帧', '分辨率', 'FPS', '耗时(ms)', '备注'])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.Stretch)
+        layout.addWidget(self.table, 1)
+
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setPlaceholderText('诊断日志会显示在这里，便于复制给开发人员。')
+        self.log_edit.setMinimumHeight(120)
+        layout.addWidget(self.log_edit)
+
+        self.setLayout(layout)
+
+        self.start_btn.clicked.connect(self.start_diagnostics)
+        self.copy_btn.clicked.connect(self.copy_report)
+        self.close_btn.clicked.connect(self.close)
+
+    def start_diagnostics(self):
+        self.start_btn.setEnabled(False)
+        self.copy_btn.setEnabled(False)
+        self.summary_label.setText('正在诊断普通相机设备，请稍候...')
+        self.table.setRowCount(0)
+        self.log_edit.clear()
+        self.owner.start_camera_b_diagnostics(self)
+
+    def append_row(self, row):
+        row_idx = self.table.rowCount()
+        self.table.insertRow(row_idx)
+        values = [
+            str(row.get('index', '')),
+            str(row.get('backend_name', '')),
+            str(row.get('status_text', '')),
+            '是' if row.get('probe_ok') else '否',
+            str(row.get('resolution_text', '')),
+            str(row.get('fps_text', '')),
+            str(row.get('elapsed_ms_text', '')),
+            str(row.get('message', '')),
+        ]
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            self.table.setItem(row_idx, col, item)
+
+    def finish_report(self, summary, report_text=''):
+        self.summary_label.setText(summary)
+        if report_text:
+            self.log_edit.setPlainText(report_text)
+        self.start_btn.setEnabled(True)
+        self.copy_btn.setEnabled(True)
+
+    def copy_report(self):
+        text = self.log_edit.toPlainText().strip()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self.summary_label.setText(self.summary_label.text() + '  报告已复制到剪贴板。')
+
+
+
 class ModelConfigDialog(QDialog):
     def __init__(self, owner, startup=False):
         super().__init__(owner)
         self.owner = owner
         self.startup = startup
+        self._page_entries = []
         self.setModal(True)
         self.setWindowTitle('启动配置向导' if startup else '模型与检测配置')
-        self.resize(860, 720)
-        self.setMinimumSize(720, 560)
+        self.resize(920, 720)
+        self.setMinimumSize(760, 560)
 
         root = QVBoxLayout()
         root.setContentsMargins(16, 16, 16, 16)
@@ -246,7 +348,7 @@ class ModelConfigDialog(QDialog):
 
         title = QLabel('启动前请确认模型与检测参数' if startup else '模型与检测配置中心')
         title.setStyleSheet('font-size:18px; font-weight:700; color:#1f2937;')
-        subtitle = QLabel('分割模型、预览模型、实时检测、场景配置和激光测距都集中在这里。配置完成后进入拍摄界面，运行中也可以随时重新打开。')
+        subtitle = QLabel('当前版本将配置面板重构为侧边导航式向导：先看当前摘要，再逐项确认模型、测量和保存习惯。运行中也可随时重新打开，并支持导入 / 导出 / 恢复默认配置。')
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet('color:#4b5563;')
         root.addWidget(title)
@@ -257,16 +359,103 @@ class ModelConfigDialog(QDialog):
         summary_label.setStyleSheet('padding:8px 10px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
         root.addWidget(summary_label)
 
-        tabs = QTabWidget()
-        tabs.setDocumentMode(True)
-        tabs.addTab(owner.build_model_config_tab(), '模型与实时检测')
-        tabs.addTab(owner.build_measurement_config_tab(), '场景 / 测量 / 激光')
-        root.addWidget(tabs, 1)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
+        search_row.addWidget(QLabel('搜索配置'))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText('输入关键字，如：ONNX、激光、保存目录、帧率、防抖、场景')
+        self.search_input.setClearButtonEnabled(True)
+        search_row.addWidget(self.search_input, 1)
+        root.addLayout(search_row)
+        self.search_hint_label = QLabel('可快速定位模型、测量、保存与启动检查相关设置。按 Ctrl+F 可直接聚焦搜索框。')
+        self.search_hint_label.setWordWrap(True)
+        self.search_hint_label.setStyleSheet('padding:8px 10px; border:1px dashed #cbd5e1; border-radius:8px; color:#475569; background:#ffffff;')
+        root.addWidget(self.search_hint_label)
+
+        startup_mode_widget = owner.build_camera_mode_selector_widget(startup=startup, compact=True)
+        if startup_mode_widget is not None:
+            root.addWidget(startup_mode_widget)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        self.nav_list = QListWidget()
+        self.nav_list.setSpacing(4)
+        self.nav_list.setUniformItemSizes(True)
+        self.nav_list.setMinimumWidth(168)
+        self.nav_list.setMaximumWidth(220)
+        self.nav_list.setStyleSheet(
+            'QListWidget {background:#f8fafc; border:1px solid #d8e3f0; border-radius:10px; padding:6px;}'
+            'QListWidget::item {padding:10px 12px; border-radius:8px; color:#334155;}'
+            'QListWidget::item:selected {background:#dbeafe; color:#1d4ed8; font-weight:600;}'
+        )
+        self.page_stack = QStackedWidget()
+        self.page_stack.setStyleSheet('QStackedWidget {background:transparent;}')
+
+        pages = [
+            ('模型与实时检测', owner.build_model_config_tab(), ['模型', 'onnx', 'pt', '预览', '实时检测', '帧率', '防抖', '巡检', 'cuda', 'gpu', 'cpu']),
+            ('场景 / 测量 / 激光', owner.build_measurement_config_tab(), ['场景', '测量', '激光', '串口', '波特率', '读数命令', '单位', '偏移', '距离']),
+            ('保存与会话', owner.build_session_config_tab(), ['保存', '目录', '导出', '导入', '配置', '会话', '恢复默认', '抓拍']),
+            ('快速检查', owner._build_quick_check_page(), ['快速检查', '启动', '排查', '清单', '体检', '模型', '测量', '保存']),
+        ]
+        for idx, (label, page, keywords) in enumerate(pages):
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, idx)
+            item.setToolTip(f"{label}：{', '.join(keywords[:6])}")
+            self.nav_list.addItem(item)
+            self.page_stack.addWidget(page)
+            self._page_entries.append({'label': label, 'keywords': keywords, 'item': item, 'page': page})
+        self.nav_list.setCurrentRow(0)
+        self.nav_list.currentRowChanged.connect(self.page_stack.setCurrentIndex)
+        self.nav_list.currentRowChanged.connect(self._update_search_context)
+
+        side_hint = QLabel('建议顺序：\n1. 确认主检测模型\n2. 确认实时检测策略\n3. 校准测量/激光\n4. 检查保存目录')
+        side_hint.setWordWrap(True)
+        side_hint.setStyleSheet('padding:10px 12px; border:1px dashed #cbd5e1; border-radius:8px; color:#475569; background:#ffffff;')
+        nav_box = QVBoxLayout()
+        nav_box.setSpacing(10)
+        nav_box.addWidget(self.nav_list, 1)
+        nav_box.addWidget(side_hint, 0)
+        nav_widget = QWidget()
+        nav_widget.setLayout(nav_box)
+
+        body.addWidget(nav_widget, 0)
+        body.addWidget(self.page_stack, 1)
+        root.addLayout(body, 1)
 
         startup_toggle = QCheckBox('启动程序时先显示此配置面板')
         startup_toggle.setChecked(bool(owner.config.ui_show_model_config_on_startup))
         startup_toggle.toggled.connect(owner.on_startup_config_toggle_changed)
         root.addWidget(startup_toggle)
+
+        config_ops_row = QHBoxLayout()
+        config_ops_row.setSpacing(8)
+        config_ops_row.addWidget(QLabel('配置操作'))
+        export_btn = QPushButton('导出配置')
+        export_btn.clicked.connect(owner.export_system_config_snapshot)
+        import_btn = QPushButton('导入配置')
+        import_btn.clicked.connect(owner.import_system_config_snapshot)
+        reset_btn = QPushButton('恢复默认')
+        reset_btn.clicked.connect(owner.restore_default_system_config)
+        config_ops_row.addStretch(1)
+        config_ops_row.addWidget(export_btn)
+        config_ops_row.addWidget(import_btn)
+        config_ops_row.addWidget(reset_btn)
+        root.addLayout(config_ops_row)
+
+        save_row = QHBoxLayout()
+        save_row.setSpacing(8)
+        save_row.addWidget(QLabel('结果保存目录'))
+        current_dir_label = QLabel(owner._shorten_path(owner.filepath, 56))
+        owner.dialog_output_dir_label = current_dir_label
+        save_row.addWidget(current_dir_label, 1)
+        choose_btn = QPushButton('📁 选择目录')
+        choose_btn.clicked.connect(owner.choose_output_directory)
+        open_btn = QPushButton('🗂️ 打开目录')
+        open_btn.clicked.connect(owner.open_output_directory)
+        save_row.addWidget(choose_btn)
+        save_row.addWidget(open_btn)
+        root.addLayout(save_row)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
@@ -296,6 +485,66 @@ class ModelConfigDialog(QDialog):
         root.addLayout(button_row)
         self.setLayout(root)
 
+        self.search_input.textChanged.connect(self._apply_search_filter)
+        self.search_input.returnPressed.connect(self._jump_to_first_search_match)
+        self.search_focus_shortcut = QShortcut(QKeySequence('Ctrl+F'), self)
+        self.search_focus_shortcut.activated.connect(self.focus_search)
+        self._update_search_context(0)
+
+    def focus_search(self):
+        self.search_input.setFocus()
+        self.search_input.selectAll()
+
+    def _entry_matches_query(self, entry, query):
+        if not query:
+            return True
+        haystacks = [entry.get('label', '')] + list(entry.get('keywords', []) or [])
+        query = query.lower()
+        return any(query in str(token).lower() for token in haystacks)
+
+    def _visible_entry_indexes(self):
+        visible = []
+        for idx, entry in enumerate(self._page_entries):
+            item = entry.get('item')
+            if item is not None and not item.isHidden():
+                visible.append(idx)
+        return visible
+
+    def _jump_to_first_search_match(self):
+        visible = self._visible_entry_indexes()
+        if visible:
+            self.nav_list.setCurrentRow(visible[0])
+
+    def _update_search_context(self, index):
+        if index < 0 or index >= len(self._page_entries):
+            return
+        entry = self._page_entries[index]
+        keywords = ' / '.join(entry.get('keywords', [])[:8])
+        query = self.search_input.text().strip()
+        if query:
+            visible_count = len(self._visible_entry_indexes())
+            self.search_hint_label.setText(f"搜索“{query}”命中 {visible_count} 个页面。当前定位：{entry.get('label', '')}。相关关键词：{keywords}")
+        else:
+            self.search_hint_label.setText(f"当前页面：{entry.get('label', '')}。可搜索关键词：{keywords}")
+
+    def _apply_search_filter(self, text):
+        query = str(text or '').strip()
+        matched_indexes = []
+        for idx, entry in enumerate(self._page_entries):
+            matched = self._entry_matches_query(entry, query)
+            item = entry.get('item')
+            if item is not None:
+                item.setHidden(not matched)
+            if matched:
+                matched_indexes.append(idx)
+        current_row = self.nav_list.currentRow()
+        if not matched_indexes:
+            self.search_hint_label.setText(f'未找到与“{query}”匹配的配置页，请换个关键词试试。')
+            return
+        if current_row not in matched_indexes:
+            self.nav_list.setCurrentRow(matched_indexes[0])
+        self._update_search_context(self.nav_list.currentRow())
+
     def closeEvent(self, event):
         if self.startup:
             try:
@@ -323,6 +572,8 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.device_search_busy_a = False
         self.device_search_busy_b = False
         self.device_search_cache_b = {'timestamp': 0.0, 'devices': []}
+        self.device_search_force_refresh_b = False
+        self.camera_probe_backend_cache = {}
         self.current_camera_b_backend = None
 
         self.deal_picture_flag = False
@@ -338,6 +589,9 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.frame_b_capture = None
         self.semantic_result_b = None
         self.frame_b = None
+        self.camera_b_capture_busy = False
+        self.last_camera_b_saved_files = ('', '')
+        self.last_saved_artifacts = {}
 
         self.semantic_result_ca = None
         self.picturename_a = None
@@ -427,16 +681,76 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.display_label_keys = {}
         self.zoom_dialog = None
         self.current_zoom_key = None
+        self.display_labels_by_key = {}
+        self._deferred_display_keys = set()
+        self._suspend_live_repaint_until = 0.0
+        self._window_drag_state = ''
+        self.zoom_live_update_timer = QTimer(self)
+        self.zoom_live_update_timer.setSingleShot(True)
+        self.zoom_live_update_timer.timeout.connect(self._flush_zoom_dialog_update)
+        self._last_zoom_live_update_ts = 0.0
+        self._pending_zoom_dialog_image = None
+        self._pending_zoom_dialog_title = ''
+        self.live_layout_debounce_timer = QTimer(self)
+        self.live_layout_debounce_timer.setSingleShot(True)
+        self.live_layout_debounce_timer.timeout.connect(self._flush_deferred_display_updates)
+        self.status_layout_debounce_timer = QTimer(self)
+        self.status_layout_debounce_timer.setSingleShot(True)
+        self.status_layout_debounce_timer.timeout.connect(self._update_status_cards_layout)
+        self.model_status_debounce_timer = QTimer(self)
+        self.model_status_debounce_timer.setSingleShot(True)
+        self.model_status_debounce_timer.timeout.connect(self._flush_pending_model_status_label)
+        self._last_model_status_update_ts = 0.0
+        self._pending_model_status_message = None
+        self._last_model_status_rendered = ''
+        self.live_panel_camera_a = None
+        self.live_panel_camera_b = None
+        self.analysis_panel_main = None
+        self.analysis_panel_seg = None
+        self.analysis_panel_transform = None
+        self.analysis_panel_final = None
+        self.camera_mode_radio_groups = []
         self.control_panel_scroll = None
         self.control_panel_stack = None
         self.control_panel_mode_combo = None
         self.control_panel_toggle_btn = None
+        self.workspace_mode_combo = None
+        self.live_group = None
+        self.analysis_group = None
+        self.center_splitter = None
         self.control_panel_groups = {}
         self._control_panel_expanded_layout = None
         self._control_panel_tabs = None
         self.model_config_dialog = None
         self.model_config_button = None
         self.config_summary_label = None
+        self.runtime_strip_label = None
+        self.output_dir_label = None
+        self.last_save_label = None
+        self.session_output_dir_label = None
+        self.dialog_output_dir_label = None
+        self.status_cards_container = None
+        self.status_cards_layout = None
+        self.status_cards_columns = 0
+        self.status_runtime_card = None
+        self.status_model_card = None
+        self.status_fps_card = None
+        self.status_save_card = None
+        self.status_camera_a_card = None
+        self.status_camera_b_card = None
+        self.choose_output_dir_btn = None
+        self.open_output_dir_btn = None
+        self.event_log_group = None
+        self.event_log_text = None
+        self.event_log_toggle_btn = None
+        self.event_log_clear_btn = None
+        self.export_runtime_log_btn = None
+        self.restore_layout_btn = None
+        self.preview_mode_a_combo = None
+        self.preview_mode_b_combo = None
+        self.runtime_event_entries = deque(maxlen=120)
+        self._last_runtime_event = ''
+        self._last_runtime_event_ts = 0.0
         self.preview_stab_prev_gray = None
         self.preview_stab_prev_pts = None
         self.preview_stab_trajectory = np.zeros(3, dtype=np.float32)
@@ -492,11 +806,13 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                               )
 
         """ 相机B """
-        self.save_b_btn = QPushButton("💾 保存结果")
-        self.capture_b_btn = QPushButton("📷 获取图像")
+        self.save_b_btn = QPushButton("💾 重新保存最近结果")
+        self.capture_b_btn = QPushButton("📸 抓拍并自动保存")
         self.open_close_b_btn = QPushButton("▶️ 打开设备")
         self.find_b_btn = QPushButton("🔍 设备查找")
+        self.diagnose_b_btn = QPushButton("🩺 设备诊断")
         self.save_b_btn.setEnabled(False)
+        self.save_b_btn.setToolTip("普通相机B点击“获取图像”时会自动保存原图和检测结果；此按钮用于重新保存最后一次结果。")
         self.capture_b_btn.setEnabled(False)
         self.open_close_b_btn.setEnabled(False)
 
@@ -563,10 +879,20 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.laser_manual_btn = QPushButton("✍️ 手动距离")
         self.laser_baudrate_input = QLineEdit(str(self.config.laser_baudrate))
         self.laser_baudrate_input.setMaximumWidth(100)
+        self.laser_baudrate_combo = QComboBox()
+        self.laser_baudrate_combo.setEditable(True)
+        for baud in ['1200', '2400', '4800', '9600', '19200', '38400', '57600', '115200']:
+            self.laser_baudrate_combo.addItem(baud)
+        self.laser_baudrate_combo.setCurrentText(str(int(self.config.laser_baudrate)))
+        self.laser_baudrate_combo.setMaximumWidth(120)
         self.laser_hfov_input = QLineEdit(f"{float(self.config.camera_horizontal_fov_deg):.2f}")
         self.laser_hfov_input.setMaximumWidth(100)
         self.laser_offset_input = QLineEdit(f"{float(self.config.laser_distance_offset_mm):.2f}")
         self.laser_offset_input.setMaximumWidth(100)
+        self.laser_offset_spin = QLineEdit(f"{float(self.config.laser_distance_offset_mm):.2f}")
+        self.laser_offset_spin.setMaximumWidth(100)
+        self.laser_command_input = QLineEdit(str(getattr(self.config, 'laser_command', '') or ''))
+        self.laser_command_input.setPlaceholderText('可选：发送给测距仪的读取命令')
         self.measurement_mode_combo = QComboBox()
         self.measurement_mode_combo.addItems(["calibration_first", "laser_first", "hybrid_average", "laser_only"])
         mode_index = self.measurement_mode_combo.findText(self.config.measurement_mode)
@@ -580,7 +906,8 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.laser_distance_label = QLabel("激光距离：未读取")
         self.laser_distance_label.setWordWrap(True)
 
-        for btn in [self.find_b_btn, self.open_close_b_btn, self.capture_b_btn, self.save_b_btn]:
+        self.diagnose_b_btn.setToolTip('扫描普通相机索引并显示 DSHOW/MSMF/AUTO 的探测结果。')
+        for btn in [self.find_b_btn, self.diagnose_b_btn, self.open_close_b_btn, self.capture_b_btn, self.save_b_btn]:
             btn.setMinimumHeight(35)
             btn.setStyleSheet("QPushButton {background-color: #6aa84f; color: white; border-radius: 5px;}"
                               "QPushButton:hover{background-color: #4a983f;}"
@@ -589,7 +916,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         ByteArrayType = ctypes.c_ubyte * 5000 * 5000
         self.buf_save_image = ByteArrayType()
 
-        self.filepath = os.path.join(self.base_dir, 'data')
+        self.filepath = self._resolve_output_dir_value(getattr(self.config, 'output_dir', 'data'))
         self.debug_dir = os.path.join(self.filepath, 'debug')
         os.makedirs(self.filepath, exist_ok=True)
         os.makedirs(self.debug_dir, exist_ok=True)
@@ -618,6 +945,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.ui_refresh_timer.start(max(15, int(getattr(self.config, 'ui_refresh_interval_ms', 33))))
         self.fps_update_timer.start(500)
         self.update_model_status_label('系统初始化完成')
+        self.append_runtime_event(f'系统已启动，当前版本 {APP_VERSION}。', level='ok')
         self.update_fps_status_label()
 
     def init_ui(self):
@@ -649,7 +977,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             group.setLayout(layout)
             return group
 
-        def build_camera_control_group(title, connection_combo, input_box, find_btn, device_combo, open_btn, capture_btn, save_btn, pos_edit, width_edit, dist_edit):
+        def build_camera_control_group(title, connection_combo, input_box, find_btn, device_combo, open_btn, capture_btn, save_btn, pos_edit, width_edit, dist_edit, extra_find_btn=None):
             group = QGroupBox(title)
             group.setStyleSheet(panel_style)
             root = QVBoxLayout()
@@ -668,6 +996,8 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
 
             row3 = QHBoxLayout()
             row3.addWidget(find_btn, 2)
+            if extra_find_btn is not None:
+                row3.addWidget(extra_find_btn, 2)
             row3.addWidget(device_combo, 5)
             root.addLayout(row3)
 
@@ -710,37 +1040,54 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.camera_a_display.setText('工业相机 A 预览')
         self.camera_a_display.setStyleSheet('background-color:#111; border:1px solid #d6dee8; border-radius: 6px;')
         self.camera_a_display.setProperty('fast_display', True)
-        self.camera_a_display.setProperty('display_mode', 'fill' if bool(getattr(self.config, 'ui_preview_fill_camera_a', True)) else 'fit')
+        preview_mode_a = str(getattr(self.config, 'ui_preview_mode_camera_a', 'fill' if bool(getattr(self.config, 'ui_preview_fill_camera_a', True)) else 'fit'))
+        self.camera_a_display.setProperty('display_mode', preview_mode_a if preview_mode_a in {'fill', 'fit'} else 'fill')
         self.camera_a_display.setProperty('allow_upscale', bool(getattr(self.config, 'ui_preview_allow_upscale', True)))
         setup_display_label(self.camera_b_display, '普通相机 B 预览')
-        self.camera_b_display.setProperty('display_mode', 'fill' if bool(getattr(self.config, 'ui_preview_fill_camera_b', False)) else 'fit')
+        preview_mode_b = str(getattr(self.config, 'ui_preview_mode_camera_b', 'fill' if bool(getattr(self.config, 'ui_preview_fill_camera_b', False)) else 'fit'))
+        self.camera_b_display.setProperty('display_mode', preview_mode_b if preview_mode_b in {'fill', 'fit'} else 'fit')
         self.camera_b_display.setProperty('allow_upscale', bool(getattr(self.config, 'ui_preview_allow_upscale', True)))
         setup_display_label(self.main_display, '实时分析叠加视图')
-        setup_display_label(self.seg_display, '采集图像 / 手动导入图像')
-        setup_display_label(self.transform_display, '裂缝阴影遮罩 / 掩膜结果')
-        setup_display_label(self.final_display, '最终测量结果')
+        self.main_display.setProperty('fast_display', True)
+        setup_display_label(self.seg_display, '工业相机采集图像 / 手动导入图像')
+        setup_display_label(self.transform_display, '普通相机B实时裂缝阴影遮罩')
+        setup_display_label(self.final_display, '工业相机最终测量结果')
         self.seg_display.setProperty('fast_display', False)
         self.transform_display.setProperty('fast_display', False)
         self.final_display.setProperty('fast_display', False)
+        for _label in [self.camera_a_display, self.camera_b_display, self.main_display, self.seg_display, self.transform_display, self.final_display]:
+            try:
+                _label.setAttribute(Qt.WA_OpaquePaintEvent, True)
+                _label.setAutoFillBackground(False)
+            except Exception:
+                pass
         self.install_display_double_click_handlers()
 
         live_grid = QGridLayout()
         live_grid.setSpacing(12)
-        live_grid.addWidget(build_live_panel('工业相机 A 实时视频', self.camera_a_display), 0, 0)
-        live_grid.addWidget(build_live_panel('普通相机 B 实时视频', self.camera_b_display), 0, 1)
+        self.live_panel_camera_a = build_live_panel('工业相机 A 实时视频', self.camera_a_display)
+        live_grid.addWidget(self.live_panel_camera_a, 0, 0)
+        self.live_panel_camera_b = build_live_panel('普通相机 B 实时视频', self.camera_b_display)
+        live_grid.addWidget(self.live_panel_camera_b, 0, 1)
         live_grid.setColumnStretch(0, 1)
         live_grid.setColumnStretch(1, 1)
         live_grid.setRowStretch(0, 1)
         live_group = QGroupBox('实时视频区')
         live_group.setStyleSheet(panel_style)
         live_group.setLayout(live_grid)
+        self.live_group = live_group
+        self.live_grid = live_grid
 
         analysis_grid = QGridLayout()
         analysis_grid.setSpacing(12)
-        analysis_grid.addWidget(build_live_panel('实时检测叠加', self.main_display), 0, 0)
-        analysis_grid.addWidget(build_live_panel('采集图像', self.seg_display), 0, 1)
-        analysis_grid.addWidget(build_live_panel('裂缝阴影遮罩', self.transform_display), 1, 0)
-        analysis_grid.addWidget(build_live_panel('最终测量结果', self.final_display), 1, 1)
+        self.analysis_panel_main = build_live_panel('实时检测叠加', self.main_display)
+        analysis_grid.addWidget(self.analysis_panel_main, 0, 0)
+        self.analysis_panel_seg = build_live_panel('工业相机采集图像', self.seg_display)
+        analysis_grid.addWidget(self.analysis_panel_seg, 0, 1)
+        self.analysis_panel_transform = build_live_panel('普通相机B实时裂缝阴影遮罩', self.transform_display)
+        analysis_grid.addWidget(self.analysis_panel_transform, 1, 0)
+        self.analysis_panel_final = build_live_panel('工业相机最终测量结果', self.final_display)
+        analysis_grid.addWidget(self.analysis_panel_final, 1, 1)
         analysis_grid.setColumnStretch(0, 1)
         analysis_grid.setColumnStretch(1, 1)
         analysis_grid.setRowStretch(0, 1)
@@ -748,6 +1095,8 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         analysis_group = QGroupBox('分析结果区')
         analysis_group.setStyleSheet(panel_style)
         analysis_group.setLayout(analysis_grid)
+        self.analysis_group = analysis_group
+        self.analysis_grid = analysis_grid
 
         center_splitter = QSplitter(Qt.Vertical)
         center_splitter.addWidget(live_group)
@@ -755,6 +1104,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         center_splitter.setChildrenCollapsible(False)
         center_splitter.setStretchFactor(0, 1)
         center_splitter.setStretchFactor(1, 1)
+        self.center_splitter = center_splitter
 
         self.model_config_content = self.build_model_config_content(panel_style)
         self.config_summary_label = QLabel('模型配置：准备中')
@@ -763,8 +1113,49 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.config_summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.config_summary_label.setStyleSheet('padding:8px 10px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
 
+        self.runtime_strip_label = QLabel('运行摘要：准备中')
+        self.runtime_strip_label.hide()
+        self.output_dir_label = QLabel('保存目录：准备中')
+        self.output_dir_label.hide()
+        self.last_save_label = QLabel('最近保存：无')
+        self.last_save_label.hide()
+
+        self.status_cards_container = QWidget()
+        self.status_cards_layout = QGridLayout()
+        self.status_cards_layout.setSpacing(8)
+        self.status_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.status_cards_container.setLayout(self.status_cards_layout)
+        self.status_runtime_card = self._create_status_card('运行设备', '#2563eb')
+        self.status_model_card = self._create_status_card('模型配置', '#7c3aed')
+        self.status_fps_card = self._create_status_card('实时性能', '#0f766e')
+        self.status_save_card = self._create_status_card('结果保存', '#b45309')
+        self.status_camera_a_card = self._create_status_card('工业相机 A', '#1d4ed8')
+        self.status_camera_b_card = self._create_status_card('普通相机 B', '#16a34a')
+        self._update_status_cards_layout(force=True)
+        self._install_status_card_actions()
+
+        self.event_log_group = QGroupBox('运行日志')
+        self.event_log_group.setStyleSheet(panel_style)
+        event_log_layout = QVBoxLayout()
+        event_log_layout.setContentsMargins(12, 14, 12, 12)
+        event_log_layout.setSpacing(8)
+        event_log_hint = QLabel('记录最近的重要操作、模型切换、抓拍保存与异常提示，便于现场排查。')
+        event_log_hint.setWordWrap(True)
+        event_log_hint.setStyleSheet('color:#64748b;')
+        self.event_log_text = QTextEdit()
+        self.event_log_text.setReadOnly(True)
+        self.event_log_text.setMinimumHeight(108)
+        self.event_log_text.setMaximumHeight(168)
+        self.event_log_text.setStyleSheet('background:#0f172a; color:#e2e8f0; border:1px solid #1e293b; border-radius:8px; padding:8px; font-family:Consolas, Microsoft YaHei UI, monospace; font-size:12px;')
+        event_log_layout.addWidget(event_log_hint)
+        event_log_layout.addWidget(self.event_log_text)
+        self.event_log_group.setLayout(event_log_layout)
+        self.event_log_group.setVisible(bool(getattr(self.config, 'ui_show_event_log', True)))
+        if self.event_log_toggle_btn is not None:
+            self.event_log_toggle_btn.setText('隐藏运行日志' if self.event_log_group.isVisible() else '显示运行日志')
+
         camera_a_group = build_camera_control_group('工业相机 A 控制', self.camera_a_connection, self.camera_a_input, self.find_a_btn, self.camera_a_combo_box, self.open_close_a_btn, self.capture_a_btn, self.save_a_btn, self.camera_a_position, self.camera_a_width, self.camera_a_distance)
-        camera_b_group = build_camera_control_group('普通相机 B 控制', self.camera_b_connection, self.camera_b_input, self.find_b_btn, self.camera_b_combo_box, self.open_close_b_btn, self.capture_b_btn, self.save_b_btn, self.camera_b_position, self.camera_b_width, self.camera_b_distance)
+        camera_b_group = build_camera_control_group('普通相机 B 控制', self.camera_b_connection, self.camera_b_input, self.find_b_btn, self.camera_b_combo_box, self.open_close_b_btn, self.capture_b_btn, self.save_b_btn, self.camera_b_position, self.camera_b_width, self.camera_b_distance, extra_find_btn=self.diagnose_b_btn)
 
         self.control_panel_groups = {
             '工业相机A': camera_a_group,
@@ -799,16 +1190,71 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         panel_toolbar.setSpacing(8)
         self.model_config_button = QPushButton('⚙️ 模型 / 检测配置')
         self.model_config_button.setMinimumHeight(34)
+        self.choose_output_dir_btn = QPushButton('📁 保存目录')
+        self.choose_output_dir_btn.setMinimumHeight(34)
+        self.open_output_dir_btn = QPushButton('🗂️ 打开目录')
+        self.open_output_dir_btn.setMinimumHeight(34)
+        self.export_runtime_log_btn = QPushButton('📝 导出日志')
+        self.export_runtime_log_btn.setMinimumHeight(34)
+        self.restore_layout_btn = QPushButton('🧭 恢复布局')
+        self.restore_layout_btn.setMinimumHeight(34)
+        self.preview_mode_a_combo = QComboBox()
+        self.preview_mode_a_combo.addItems(['工业A预览: 填充', '工业A预览: 适配'])
+        self.preview_mode_b_combo = QComboBox()
+        self.preview_mode_b_combo.addItems(['普通B预览: 填充', '普通B预览: 适配'])
+        self.preview_mode_a_combo.setCurrentText('工业A预览: 填充' if self.camera_a_display.property('display_mode') == 'fill' else '工业A预览: 适配')
+        self.preview_mode_b_combo.setCurrentText('普通B预览: 填充' if self.camera_b_display.property('display_mode') == 'fill' else '普通B预览: 适配')
+        self.event_log_toggle_btn = QPushButton('隐藏运行日志')
+        self.event_log_toggle_btn.setMinimumHeight(34)
+        self.event_log_clear_btn = QPushButton('🧹 清空日志')
+        self.event_log_clear_btn.setMinimumHeight(34)
         self.control_panel_toggle_btn = QPushButton('隐藏设备面板')
         self.control_panel_toggle_btn.setMinimumHeight(32)
         self.control_panel_mode_combo = QComboBox()
         self.control_panel_mode_combo.addItems(['紧凑标签页', '全部展开'])
         desired_mode = str(getattr(self.config, 'ui_control_panel_mode', 'compact' if small_screen else 'expanded'))
         self.control_panel_mode_combo.setCurrentText('全部展开' if desired_mode == 'expanded' else '紧凑标签页')
+        self.workspace_mode_combo = QComboBox()
+        self.workspace_mode_combo.addItems(['总览四宫格', '实时优先', '测量优先'])
+        workspace_mode = str(getattr(self.config, 'ui_workspace_mode', 'overview'))
+        workspace_text = {'overview': '总览四宫格', 'live': '实时优先', 'measure': '测量优先'}.get(workspace_mode, '总览四宫格')
+        self.workspace_mode_combo.setCurrentText(workspace_text)
+        self.quick_mode_label = QLabel('快速切换:')
+        self.quick_mode_normal_btn = QPushButton('普通')
+        self.quick_mode_dual_btn = QPushButton('双相机')
+        self.quick_view_overview_btn = QPushButton('总览')
+        self.quick_view_live_btn = QPushButton('实时')
+        self.quick_view_measure_btn = QPushButton('测量')
+        self.quick_mode_buttons = [
+            self.quick_mode_normal_btn,
+            self.quick_mode_dual_btn,
+            self.quick_view_overview_btn,
+            self.quick_view_live_btn,
+            self.quick_view_measure_btn,
+        ]
+        for btn in self.quick_mode_buttons:
+            btn.setCheckable(True)
+            btn.setMinimumHeight(30)
         panel_toolbar.addWidget(self.model_config_button, 1)
+        panel_toolbar.addWidget(self.choose_output_dir_btn, 1)
+        panel_toolbar.addWidget(self.open_output_dir_btn, 1)
+        panel_toolbar.addWidget(self.export_runtime_log_btn, 1)
+        panel_toolbar.addWidget(self.restore_layout_btn, 1)
+        panel_toolbar.addWidget(self.preview_mode_a_combo, 1)
+        panel_toolbar.addWidget(self.preview_mode_b_combo, 1)
+        panel_toolbar.addWidget(self.event_log_toggle_btn, 1)
+        panel_toolbar.addWidget(self.event_log_clear_btn, 1)
         panel_toolbar.addWidget(self.control_panel_toggle_btn, 1)
+        panel_toolbar.addWidget(QLabel('工作区:'), 0)
+        panel_toolbar.addWidget(self.workspace_mode_combo, 1)
         panel_toolbar.addWidget(QLabel('设备面板:'), 0)
         panel_toolbar.addWidget(self.control_panel_mode_combo, 1)
+        panel_toolbar.addWidget(self.quick_mode_label, 0)
+        panel_toolbar.addWidget(self.quick_mode_normal_btn, 0)
+        panel_toolbar.addWidget(self.quick_mode_dual_btn, 0)
+        panel_toolbar.addWidget(self.quick_view_overview_btn, 0)
+        panel_toolbar.addWidget(self.quick_view_live_btn, 0)
+        panel_toolbar.addWidget(self.quick_view_measure_btn, 0)
         panel_toolbar.addStretch(1)
 
         right_scroll = QScrollArea()
@@ -824,27 +1270,39 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         root_splitter.setStretchFactor(0, 6)
         root_splitter.setStretchFactor(1, 2)
         self.root_splitter = root_splitter
+        try:
+            self.root_splitter.splitterMoved.connect(lambda *_: self.persist_window_geometry())
+            self.center_splitter.splitterMoved.connect(lambda *_: self.persist_window_geometry())
+        except Exception:
+            pass
 
         main_layout = QVBoxLayout()
         main_layout.setSpacing(8)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.addLayout(panel_toolbar)
         main_layout.addWidget(self.config_summary_label)
+        main_layout.addWidget(self.status_cards_container)
+        main_layout.addWidget(self.event_log_group)
         main_layout.addWidget(root_splitter)
 
         self.setLayout(main_layout)
-        self.setWindowTitle('裂缝检测处理系统')
+        self.setWindowTitle(getattr(self.config, 'app_display_name', 'Crack Detecttion - EatRice Studio'))
         self.setWindowIcon(QIcon(resolve_first_existing_path(['./assets/icon.png', './images/icon.png'], self.base_dir)))
         self.move(10, 10)
         if screen is not None:
             target_w = min(max(1180, screen.width() - 40), 1680)
             target_h = min(max(760, screen.height() - 60), 980)
-            self.resize(target_w, target_h)
+            default_size = (target_w, target_h)
         else:
-            self.resize(1560 if small_screen else 1800, 900 if small_screen else 1040)
+            default_size = (1560 if small_screen else 1800, 900 if small_screen else 1040)
         self.setMinimumSize(1120, 720)
+        if not self.restore_window_geometry(default_size=default_size):
+            self.resize(*default_size)
 
         self.apply_control_panel_mode(self.control_panel_mode_combo.currentText(), save=False)
+        self.restore_splitter_layout()
+        self.apply_workspace_mode(self.workspace_mode_combo.currentText(), save=False)
+        self.apply_camera_module_visibility(save=False, force_overview=not bool(getattr(self.config, 'enable_camera_a_module', False)))
         if getattr(self.config, 'ui_control_panel_hidden', False):
             self.control_panel_scroll.hide()
             self.control_panel_toggle_btn.setText('显示设备面板')
@@ -853,9 +1311,27 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
 
         self.control_panel_toggle_btn.clicked.connect(self.toggle_control_panel_visibility)
         self.control_panel_mode_combo.currentTextChanged.connect(self.on_control_panel_mode_changed)
+        self.workspace_mode_combo.currentTextChanged.connect(self.on_workspace_mode_changed)
         self.model_config_button.clicked.connect(self.open_model_config_dialog)
+        self.choose_output_dir_btn.clicked.connect(self.choose_output_directory)
+        self.open_output_dir_btn.clicked.connect(self.open_output_directory)
+        self.export_runtime_log_btn.clicked.connect(self.export_runtime_event_log)
+        self.restore_layout_btn.clicked.connect(self.reset_window_layout)
+        self.preview_mode_a_combo.currentTextChanged.connect(self.on_preview_mode_a_changed)
+        self.preview_mode_b_combo.currentTextChanged.connect(self.on_preview_mode_b_changed)
+        self.event_log_toggle_btn.clicked.connect(self.toggle_event_log_visibility)
+        self.event_log_clear_btn.clicked.connect(self.clear_runtime_event_log)
+        self.quick_mode_normal_btn.clicked.connect(lambda: self.on_camera_interface_mode_changed(enable_camera_a=False, save=True, force_overview=True))
+        self.quick_mode_dual_btn.clicked.connect(lambda: self.on_camera_interface_mode_changed(enable_camera_a=True, save=True, force_overview=False))
+        self.quick_view_overview_btn.clicked.connect(lambda: self.apply_workspace_mode('总览四宫格', save=True))
+        self.quick_view_live_btn.clicked.connect(lambda: self.apply_workspace_mode('实时优先', save=True))
+        self.quick_view_measure_btn.clicked.connect(lambda: self.apply_workspace_mode('测量优先', save=True))
         self.refresh_config_summary()
+        self.refresh_runtime_strip()
+        self.refresh_quick_mode_buttons()
         self.setup_connections()
+        self.setup_shortcuts()
+        self.run_startup_self_check()
 
     def _wrap_scroll_page(self, widget):
         scroll = QScrollArea()
@@ -924,6 +1400,29 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         runtime_layout.addWidget(QLabel('巡检间隔'), 2, 2)
         runtime_layout.addWidget(self.patrol_interval_spin, 2, 3)
 
+        status_box = QLabel('说明：\n• “主检测模型”决定工业相机 A 的最终测量结果，也作为普通相机 B 的通用回退模型。\n• “预览模型”用于普通相机实时巡检和预览标注，尽量选择体积较小、速度更快的 PT 模型。\n• 如果普通相机 B 目录里存在专用薄裂缝模型，会优先按专用链路运行。')
+        status_box.setWordWrap(True)
+        status_box.setStyleSheet('padding:10px 12px; border:1px solid #d8e3f0; border-radius:8px; color:#334155; background:#f8fbff;')
+
+        model_widget = QWidget()
+        model_layout = QVBoxLayout()
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(10)
+        model_layout.addWidget(self._create_config_section('模型与实时检测', [model_dir_layout, seg_layout, preview_layout, runtime_layout], panel_style))
+        model_layout.addWidget(status_box)
+        model_layout.addStretch(1)
+        model_widget.setLayout(model_layout)
+        return model_widget
+
+    def build_model_config_tab(self):
+        return self._wrap_scroll_page(self.model_config_content)
+
+    def build_measurement_config_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
         scene_layout = QHBoxLayout()
         scene_layout.setSpacing(8)
         scene_layout.addWidget(QLabel('场景配置'), 0)
@@ -945,55 +1444,231 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         laser_port_layout.addWidget(self.laser_connect_btn, 0)
 
         laser_param_layout = QGridLayout()
-        laser_param_layout.setHorizontalSpacing(12)
+        laser_param_layout.setHorizontalSpacing(10)
         laser_param_layout.setVerticalSpacing(8)
         laser_param_layout.addWidget(QLabel('波特率'), 0, 0)
-        laser_param_layout.addWidget(self.laser_baudrate_input, 0, 1)
-        laser_param_layout.addWidget(QLabel('HFOV(°)'), 0, 2)
-        laser_param_layout.addWidget(self.laser_hfov_input, 0, 3)
-        laser_param_layout.addWidget(QLabel('偏移(mm)'), 1, 0)
-        laser_param_layout.addWidget(self.laser_offset_input, 1, 1)
-        laser_param_layout.addWidget(QLabel('单位'), 1, 2)
-        laser_param_layout.addWidget(self.laser_unit_combo, 1, 3)
-        laser_param_layout.addWidget(QLabel('尺寸估算'), 2, 0)
-        laser_param_layout.addWidget(self.measurement_mode_combo, 2, 1)
-        laser_param_layout.addWidget(self.laser_read_btn, 2, 2)
-        laser_param_layout.addWidget(self.laser_manual_btn, 2, 3)
+        laser_param_layout.addWidget(self.laser_baudrate_combo, 0, 1)
+        laser_param_layout.addWidget(QLabel('读数命令'), 0, 2)
+        laser_param_layout.addWidget(self.laser_command_input, 0, 3)
+        laser_param_layout.addWidget(self.laser_read_btn, 0, 4)
+        laser_param_layout.addWidget(QLabel('单位'), 1, 0)
+        laser_param_layout.addWidget(self.laser_unit_combo, 1, 1)
+        laser_param_layout.addWidget(QLabel('偏移(mm)'), 1, 2)
+        laser_param_layout.addWidget(self.laser_offset_spin, 1, 3)
+        laser_param_layout.addWidget(self.laser_manual_btn, 1, 4)
 
-        status_box = QGroupBox('运行状态')
-        status_box.setStyleSheet(panel_style)
-        status_layout = QVBoxLayout()
-        status_layout.setContentsMargins(12, 16, 12, 12)
-        status_layout.setSpacing(8)
-        status_layout.addWidget(self.scene_status_label)
-        status_layout.addWidget(self.laser_distance_label)
-        status_layout.addWidget(self.fps_status_label)
-        status_layout.addWidget(self.model_status_label)
-        status_box.setLayout(status_layout)
+        measure_note = QLabel('这一页专门处理“场景 / 测量 / 激光”，避免和模型选择混在一起。工业相机 A 的最终测量结果会优先读取这里的配置。')
+        measure_note.setWordWrap(True)
+        measure_note.setStyleSheet('padding:10px 12px; border:1px solid #d8e3f0; border-radius:8px; color:#334155; background:#f8fbff;')
 
-        model_widget = QWidget()
-        model_layout = QVBoxLayout()
-        model_layout.setContentsMargins(0, 0, 0, 0)
-        model_layout.setSpacing(10)
-        model_layout.addWidget(self._create_config_section('模型与实时检测', [model_dir_layout, seg_layout, preview_layout, runtime_layout], panel_style))
-        model_layout.addWidget(self._create_config_section('场景配置', [scene_layout, scene_flags_layout], panel_style))
-        model_layout.addWidget(self._create_config_section('激光测距与尺寸估算', [laser_port_layout, laser_param_layout], panel_style))
-        model_layout.addWidget(status_box)
-        model_widget.setLayout(model_layout)
-        return model_widget
+        layout.addWidget(self._create_config_section('场景配置', [scene_layout, scene_flags_layout], ''))
+        layout.addWidget(self._create_config_section('激光测距与尺寸估算', [laser_port_layout, laser_param_layout], ''))
+        layout.addWidget(measure_note)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return self._wrap_scroll_page(page)
 
-    def build_model_config_tab(self):
-        return self._wrap_scroll_page(self.model_config_content)
+    def build_camera_mode_selector_widget(self, startup=False, compact=False):
+        box = QFrame()
+        box.setStyleSheet('QFrame {background:#ffffff; border:1px solid #d8e3f0; border-radius:10px;}')
+        layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8 if compact else 10)
+        title = QLabel('启动设备模式' if startup else '设备界面模式')
+        title.setStyleSheet('font-weight:700; color:#1f2937;')
+        desc = QLabel('普通相机 B 为必选。大部分场景下使用普通相机模式即可；需要高分辨率抓拍与最终测量时，再启用工业相机 A。')
+        desc.setWordWrap(True)
+        desc.setStyleSheet('color:#475569;')
+        layout.addWidget(title)
+        layout.addWidget(desc)
 
-    def build_measurement_config_tab(self):
+        normal_radio = QRadioButton('普通相机模式（推荐，仅显示普通相机相关界面）')
+        dual_radio = QRadioButton('双相机模式（显示工业相机 A + 普通相机 B 全部模块）')
+        dual_enabled = bool(getattr(self.config, 'enable_camera_a_module', False))
+        dual_radio.setChecked(dual_enabled)
+        normal_radio.setChecked(not dual_enabled)
+        normal_radio.toggled.connect(lambda checked, dual=dual_radio: self.on_camera_interface_mode_changed(enable_camera_a=not checked if dual.isChecked() or checked else False, save=True, force_overview=checked))
+        dual_radio.toggled.connect(lambda checked: self.on_camera_interface_mode_changed(enable_camera_a=bool(checked), save=True, force_overview=False) if checked else None)
+        layout.addWidget(normal_radio)
+        layout.addWidget(dual_radio)
+        hint = QLabel('提示：切换到普通相机模式时，工业相机控制区、采集图像框和最终测量结果框会自动隐藏。')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('padding:8px 10px; border:1px dashed #cbd5e1; border-radius:8px; color:#64748b; background:#f8fafc;')
+        layout.addWidget(hint)
+        box.setLayout(layout)
+        self.camera_mode_radio_groups.append((normal_radio, dual_radio))
+        return box
+
+    def sync_camera_mode_selector_widgets(self):
+        dual_enabled = bool(getattr(self.config, 'enable_camera_a_module', False))
+        alive = []
+        for pair in list(self.camera_mode_radio_groups):
+            try:
+                normal_radio, dual_radio = pair
+                normal_radio.blockSignals(True)
+                dual_radio.blockSignals(True)
+                normal_radio.setChecked(not dual_enabled)
+                dual_radio.setChecked(dual_enabled)
+                normal_radio.blockSignals(False)
+                dual_radio.blockSignals(False)
+                alive.append(pair)
+            except Exception:
+                continue
+        self.camera_mode_radio_groups = alive
+
+    def on_camera_interface_mode_changed(self, enable_camera_a, save=True, force_overview=False):
+        enable_camera_a = bool(enable_camera_a)
+        changed = bool(getattr(self.config, 'enable_camera_a_module', False)) != enable_camera_a
+        self.config.enable_camera_a_module = enable_camera_a
+        self.config.enable_camera_b_module = True
+        self.sync_camera_mode_selector_widgets()
+        self.apply_camera_module_visibility(save=save, force_overview=force_overview or not enable_camera_a)
+        if changed:
+            mode_text = '双相机模式' if enable_camera_a else '普通相机模式'
+            self.append_runtime_event(f'设备界面已切换到“{mode_text}”。', level='info')
+
+    def apply_camera_module_visibility(self, save=True, force_overview=False):
+        enable_a = bool(getattr(self.config, 'enable_camera_a_module', False))
+        widgets = [
+            getattr(self, 'live_panel_camera_a', None),
+            getattr(self, 'analysis_panel_seg', None),
+            getattr(self, 'analysis_panel_final', None),
+            self.control_panel_groups.get('工业相机A') if isinstance(getattr(self, 'control_panel_groups', None), dict) else None,
+        ]
+        for widget in widgets:
+            if widget is not None:
+                widget.setVisible(enable_a)
+        if getattr(self, 'status_camera_a_card', None):
+            self.status_camera_a_card['frame'].setVisible(enable_a)
+        if not enable_a and getattr(self, 'cameraA', None) is not None:
+            try:
+                if bool(getattr(self.cameraA, 'b_open_device', False)):
+                    self.toggle_camera_a(True)
+            except Exception:
+                pass
+        if force_overview and getattr(self, 'workspace_mode_combo', None) is not None:
+            if self.workspace_mode_combo.currentText() != '总览四宫格':
+                self.workspace_mode_combo.blockSignals(True)
+                self.workspace_mode_combo.setCurrentText('总览四宫格')
+                self.workspace_mode_combo.blockSignals(False)
+                self.apply_workspace_mode('总览四宫格', save=False)
+        if save:
+            self.save_system_config()
+        self.refresh_config_summary()
+        self.refresh_runtime_strip()
+        self._update_status_cards_layout(force=True)
+        self._update_camera_module_layout()
+
+    def _update_camera_module_layout(self):
+        enable_a = bool(getattr(self.config, 'enable_camera_a_module', False))
+        try:
+            if getattr(self, 'live_grid', None) is not None and self.live_panel_camera_b is not None:
+                if enable_a and self.live_panel_camera_a is not None:
+                    self.live_grid.addWidget(self.live_panel_camera_a, 0, 0, 1, 1)
+                    self.live_grid.addWidget(self.live_panel_camera_b, 0, 1, 1, 1)
+                    self.live_grid.setColumnStretch(0, 1)
+                    self.live_grid.setColumnStretch(1, 1)
+                else:
+                    self.live_grid.addWidget(self.live_panel_camera_b, 0, 0, 1, 2)
+                    self.live_grid.setColumnStretch(0, 1)
+                    self.live_grid.setColumnStretch(1, 0)
+            if getattr(self, 'analysis_grid', None) is not None and self.analysis_panel_main is not None and self.analysis_panel_transform is not None:
+                if enable_a and self.analysis_panel_seg is not None and self.analysis_panel_final is not None:
+                    self.analysis_grid.addWidget(self.analysis_panel_main, 0, 0, 1, 1)
+                    self.analysis_grid.addWidget(self.analysis_panel_seg, 0, 1, 1, 1)
+                    self.analysis_grid.addWidget(self.analysis_panel_transform, 1, 0, 1, 1)
+                    self.analysis_grid.addWidget(self.analysis_panel_final, 1, 1, 1, 1)
+                    self.analysis_grid.setColumnStretch(0, 1)
+                    self.analysis_grid.setColumnStretch(1, 1)
+                    self.analysis_grid.setRowStretch(0, 1)
+                    self.analysis_grid.setRowStretch(1, 1)
+                else:
+                    self.analysis_grid.addWidget(self.analysis_panel_main, 0, 0, 1, 2)
+                    self.analysis_grid.addWidget(self.analysis_panel_transform, 1, 0, 1, 2)
+                    self.analysis_grid.setColumnStretch(0, 1)
+                    self.analysis_grid.setColumnStretch(1, 0)
+                    self.analysis_grid.setRowStretch(0, 1)
+                    self.analysis_grid.setRowStretch(1, 1)
+        except Exception as exc:
+            self.append_runtime_event(f'更新单/双相机布局失败: {exc}', level='warn')
+
+    def _mark_window_interacting(self, reason='move', duration_ms=160):
+        self._window_drag_state = str(reason or 'move')
+        self._suspend_live_repaint_until = max(self._suspend_live_repaint_until, time.time() + max(0.05, duration_ms / 1000.0))
+        try:
+            self.live_layout_debounce_timer.start(max(40, int(duration_ms)))
+        except Exception:
+            pass
+
+    def _schedule_status_cards_layout_update(self, delay_ms=90):
+        try:
+            self.status_layout_debounce_timer.start(max(40, int(delay_ms)))
+        except Exception:
+            self._update_status_cards_layout()
+
+    def _flush_deferred_display_updates(self):
+        self._suspend_live_repaint_until = 0.0
+        pending_keys = list(getattr(self, '_deferred_display_keys', set()))
+        self._deferred_display_keys.clear()
+        for key in pending_keys:
+            label = self.display_labels_by_key.get(key) if hasattr(self, 'display_labels_by_key') else None
+            image = self.latest_display_images.get(key) if hasattr(self, 'latest_display_images') else None
+            if label is not None and image is not None:
+                try:
+                    self.display_image(image, label)
+                except Exception:
+                    pass
+
+    def _queue_zoom_dialog_update(self, image, title='预览放大'):
+        if self.zoom_dialog is None or not self.zoom_dialog.isVisible() or image is None:
+            return
+        max_fps = max(1, int(getattr(self.config, 'ui_zoom_live_fps', 12) or 12))
+        min_interval_s = 1.0 / float(max_fps)
+        now = time.perf_counter()
+        elapsed = now - float(getattr(self, '_last_zoom_live_update_ts', 0.0))
+        if elapsed >= min_interval_s:
+            self._last_zoom_live_update_ts = now
+            self._pending_zoom_dialog_image = None
+            self._pending_zoom_dialog_title = ''
+            try:
+                self.zoom_dialog.update_live_image(image, title)
+            except Exception:
+                self.zoom_dialog.set_image(image, title)
+            return
+        self._pending_zoom_dialog_image = image.copy() if isinstance(image, np.ndarray) else image
+        self._pending_zoom_dialog_title = str(title or '预览放大')
+        remain_ms = max(10, int(round((min_interval_s - elapsed) * 1000.0)))
+        try:
+            self.zoom_live_update_timer.start(remain_ms)
+        except Exception:
+            pass
+
+    def _flush_zoom_dialog_update(self):
+        if self.zoom_dialog is None or not self.zoom_dialog.isVisible():
+            self._pending_zoom_dialog_image = None
+            self._pending_zoom_dialog_title = ''
+            return
+        image = self._pending_zoom_dialog_image
+        title = self._pending_zoom_dialog_title or self.zoom_dialog.windowTitle()
+        self._pending_zoom_dialog_image = None
+        self._pending_zoom_dialog_title = ''
+        if image is None:
+            return
+        self._last_zoom_live_update_ts = time.perf_counter()
+        try:
+            self.zoom_dialog.update_live_image(image, title)
+        except Exception:
+            self.zoom_dialog.set_image(image, title)
+
+    def _build_quick_check_page(self):
         placeholder = QWidget()
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-        hint = QLabel('建议先确认主检测模型、预览模型和实时检测开关，再根据场景决定是否启用场景配置与激光测距。该页主要用于快速检查，不会和主配置页抢占控件。')
+        hint = QLabel('建议先确认主检测模型、预览模型和实时检测开关，再根据场景决定是否启用场景配置与激光测距。这一页只做启动前快速体检。')
         hint.setWordWrap(True)
         hint.setStyleSheet('padding:8px 10px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
-        checklist = QLabel('快速检查清单：\n1. 主检测模型是否指向当前工程的可用模型；\n2. 普通相机 B 是否开启实时检测；\n3. 工业相机 A 如需最终测量，请确认场景/激光参数已设置；\n4. 切换模型后点击“应用当前模型”。')
+        checklist = QLabel('快速检查清单：\n1. 主检测模型是否指向当前工程的可用模型；\n2. 普通相机 B 是否开启实时检测；\n3. 工业相机 A 如需最终测量，请确认场景/激光参数已设置；\n4. 切换模型后点击“应用当前模型”；\n5. 如果是小屏幕，可把工作区切到“实时优先”或“测量优先”。')
         checklist.setWordWrap(True)
         checklist.setStyleSheet('padding:10px 12px; border:1px dashed #cbd5e1; border-radius:8px; color:#475569; background:#ffffff;')
         runtime_hint = QLabel('运行状态摘要会实时显示在拍摄界面顶部，便于在小屏幕上边拍边看，无需一直打开配置弹窗。')
@@ -1006,8 +1681,409 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         placeholder.setLayout(layout)
         return self._wrap_scroll_page(placeholder)
 
+    def build_session_config_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        hint = QLabel('这里集中管理结果保存目录和会话习惯。建议把保存目录放在 SSD 或项目工作目录中，便于持续采集和复盘。')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('padding:8px 10px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
+        path_box = QLabel(self._shorten_path(self.filepath, 72))
+        self.session_output_dir_label = path_box
+        path_box.setWordWrap(True)
+        path_box.setStyleSheet('padding:10px 12px; border:1px solid #dfe7ef; border-radius:8px; background:#ffffff; color:#334155;')
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        choose_btn = QPushButton('📁 选择保存目录')
+        choose_btn.clicked.connect(self.choose_output_directory)
+        open_btn = QPushButton('🗂️ 打开当前目录')
+        open_btn.clicked.connect(self.open_output_directory)
+        export_btn = QPushButton('导出配置')
+        export_btn.clicked.connect(self.export_system_config_snapshot)
+        import_btn = QPushButton('导入配置')
+        import_btn.clicked.connect(self.import_system_config_snapshot)
+        row.addWidget(choose_btn)
+        row.addWidget(open_btn)
+        row.addWidget(export_btn)
+        row.addWidget(import_btn)
+        row.addStretch(1)
+        note = QLabel('普通相机 B 抓拍会自动保存原图和检测结果；工业相机 A 的抓拍与最终测量结果也会统一写入这里。')
+        note.setWordWrap(True)
+        note.setStyleSheet('padding:8px 10px; border:1px dashed #cbd5e1; border-radius:8px; color:#475569; background:#ffffff;')
+        layout.addWidget(hint)
+        layout.addWidget(self.build_camera_mode_selector_widget(startup=False, compact=False))
+        layout.addWidget(QLabel('当前保存目录'))
+        layout.addWidget(path_box)
+        layout.addLayout(row)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return self._wrap_scroll_page(page)
+
+    def _create_status_card(self, title, accent='#2563eb'):
+        frame = QFrame()
+        frame.setObjectName('statusCard')
+        frame.setStyleSheet(
+            f"QFrame#statusCard {{background:#ffffff; border:1px solid #dfe7ef; border-left:4px solid {accent}; border-radius:10px;}}"
+            " QLabel[role='title'] {color:#64748b; font-size:12px; font-weight:600;}"
+            " QLabel[role='value'] {color:#0f172a; font-size:16px; font-weight:700;}"
+            " QLabel[role='subtitle'] {color:#475569; font-size:12px;}"
+        )
+        layout = QVBoxLayout()
+        layout.setSpacing(3)
+        layout.setContentsMargins(12, 10, 12, 10)
+        title_label = QLabel(title)
+        title_label.setProperty('role', 'title')
+        value_label = QLabel('准备中')
+        value_label.setProperty('role', 'value')
+        value_label.setWordWrap(True)
+        subtitle_label = QLabel('')
+        subtitle_label.setProperty('role', 'subtitle')
+        subtitle_label.setWordWrap(True)
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        layout.addWidget(subtitle_label)
+        frame.setLayout(layout)
+        return {'frame': frame, 'title': title_label, 'value': value_label, 'subtitle': subtitle_label}
+
+    def _apply_status_card_state(self, card, state='info'):
+        if not card:
+            return
+        palette = {
+            'info': ('#2563eb', '#eff6ff', '#0f172a', '#475569'),
+            'ok': ('#16a34a', '#f0fdf4', '#14532d', '#166534'),
+            'warn': ('#d97706', '#fffbeb', '#7c2d12', '#92400e'),
+            'danger': ('#dc2626', '#fef2f2', '#7f1d1d', '#b91c1c'),
+        }
+        accent, bg, value_color, subtitle_color = palette.get(state, palette['info'])
+        card['frame'].setStyleSheet(
+            f"QFrame#statusCard {{background:{bg}; border:1px solid #dfe7ef; border-left:4px solid {accent}; border-radius:10px;}}"
+            " QLabel[role='title'] {color:#64748b; font-size:12px; font-weight:600;}"
+            f" QLabel[role='value'] {{color:{value_color}; font-size:16px; font-weight:700;}}"
+            f" QLabel[role='subtitle'] {{color:{subtitle_color}; font-size:12px;}}"
+        )
+
+    def _set_status_card(self, card, value, subtitle='', state='info'):
+        if not card:
+            return
+        card['value'].setText(str(value or ''))
+        card['subtitle'].setText(str(subtitle or ''))
+        card['subtitle'].setVisible(bool(subtitle))
+        self._apply_status_card_state(card, state)
+
+    def _make_status_card_clickable(self, card, tooltip, callback):
+        if not card or not card.get('frame'):
+            return
+        frame = card['frame']
+        frame.setCursor(Qt.PointingHandCursor)
+        frame.setToolTip(str(tooltip or '点击执行操作'))
+        def _handler(event, cb=callback):
+            try:
+                if callable(cb):
+                    cb()
+            except Exception as exc:
+                self.append_runtime_event(f'状态卡操作失败: {exc}', level='warn')
+            try:
+                event.accept()
+            except Exception:
+                pass
+        frame.mousePressEvent = _handler
+
+    def _scroll_widget_into_view(self, widget):
+        if widget is None or self.control_panel_scroll is None:
+            return
+        try:
+            container = self.control_panel_scroll.widget()
+            if container is None:
+                return
+            y = widget.mapTo(container, QPoint(0, 0)).y()
+            bar = self.control_panel_scroll.verticalScrollBar()
+            target = max(0, y - 16)
+            bar.setValue(target)
+        except Exception:
+            pass
+
+    def _ensure_control_panel_visible(self):
+        if self.control_panel_scroll is None:
+            return
+        if self.control_panel_scroll.isHidden():
+            self.control_panel_scroll.setHidden(False)
+            self.config.ui_control_panel_hidden = False
+            if self.control_panel_toggle_btn is not None:
+                self.control_panel_toggle_btn.setText('隐藏设备面板')
+
+    def _focus_control_group(self, title):
+        self._ensure_control_panel_visible()
+        widget = self.control_panel_groups.get(title)
+        if widget is None:
+            return
+        compact = str(getattr(self.config, 'ui_control_panel_mode', 'compact')) == 'compact'
+        if compact and self._control_panel_tabs is not None:
+            for idx in range(self._control_panel_tabs.count()):
+                if self._control_panel_tabs.tabText(idx) == title:
+                    self._control_panel_tabs.setCurrentIndex(idx)
+                    break
+        self._scroll_widget_into_view(widget)
+        try:
+            widget.raise_()
+        except Exception:
+            pass
+
+    def _install_status_card_actions(self):
+        self._make_status_card_clickable(self.status_runtime_card, '点击打开模型 / 检测配置', lambda: self.open_model_config_dialog(startup=False))
+        self._make_status_card_clickable(self.status_model_card, '点击打开模型 / 检测配置', lambda: self.open_model_config_dialog(startup=False))
+        self._make_status_card_clickable(self.status_fps_card, '点击切换到实时优先工作区', lambda: self.apply_workspace_mode('实时优先', save=True))
+        self._make_status_card_clickable(self.status_save_card, '点击打开结果保存目录', self.open_output_directory)
+        self._make_status_card_clickable(self.status_camera_a_card, '点击定位到工业相机 A 控制区', lambda: self._focus_control_group('工业相机A'))
+        self._make_status_card_clickable(self.status_camera_b_card, '点击定位到普通相机 B 控制区', lambda: self._focus_control_group('普通相机B'))
+
+    def append_runtime_event(self, message, level='info'):
+        message = str(message or '').strip()
+        if not message:
+            return
+        now = time.time()
+        if message == self._last_runtime_event and (now - self._last_runtime_event_ts) < 1.2:
+            return
+        self._last_runtime_event = message
+        self._last_runtime_event_ts = now
+        level = str(level or 'info').lower()
+        if level not in {'info', 'ok', 'warn', 'danger'}:
+            level = 'info'
+        ts = datetime.now().strftime('%H:%M:%S')
+        prefix = {'info': 'INFO', 'ok': ' OK ', 'warn': 'WARN', 'danger': 'ERR '}.get(level, 'INFO')
+        self.runtime_event_entries.append(f'[{ts}] [{prefix}] {message}')
+        if self.event_log_text is not None:
+            self.event_log_text.setPlainText('\n'.join(self.runtime_event_entries))
+            bar = self.event_log_text.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+    def clear_runtime_event_log(self):
+        self.runtime_event_entries.clear()
+        self._last_runtime_event = ''
+        self._last_runtime_event_ts = 0.0
+        if self.event_log_text is not None:
+            self.event_log_text.clear()
+        self.append_runtime_event('运行日志已清空。', level='info')
+
+    def export_runtime_event_log(self):
+        log_dir = os.path.join(self.filepath, 'runtime_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        filename = os.path.join(log_dir, f"runtime_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        lines = [
+            f"应用版本: {APP_VERSION}",
+            f"导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"工作目录: {self.base_dir}",
+            f"保存目录: {self.filepath}",
+            '',
+            '--- 运行日志 ---',
+        ]
+        lines.extend(list(self.runtime_event_entries) or ['(无日志记录)'])
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            self.append_runtime_event(f'运行日志已导出: {filename}', level='ok')
+            QMessageBox.information(self, '导出成功', f'运行日志已导出：\n{filename}')
+        except Exception as exc:
+            self.append_runtime_event(f'运行日志导出失败: {exc}', level='danger')
+            QMessageBox.warning(self, '导出失败', f'运行日志导出失败：\n{exc}')
+
+    def _apply_preview_mode(self, label, mode):
+        if label is None:
+            return
+        mode = 'fill' if str(mode).strip().lower() == 'fill' else 'fit'
+        label.setProperty('display_mode', mode)
+        key = self.display_label_keys.get(id(label))
+        latest = self.latest_display_images.get(key) if key else None
+        if latest is not None:
+            try:
+                self.display_image(latest, label)
+            except Exception:
+                pass
+
+    def on_preview_mode_a_changed(self, text):
+        mode = 'fill' if '填充' in str(text) else 'fit'
+        self.config.ui_preview_mode_camera_a = mode
+        self.config.ui_preview_fill_camera_a = bool(mode == 'fill')
+        self.save_system_config()
+        self._apply_preview_mode(self.camera_a_display, mode)
+        mode_text = '填充' if mode == 'fill' else '适配'
+        self.append_runtime_event(f'工业相机 A 预览模式切换为：{mode_text}。', level='info')
+
+    def on_preview_mode_b_changed(self, text):
+        mode = 'fill' if '填充' in str(text) else 'fit'
+        self.config.ui_preview_mode_camera_b = mode
+        self.config.ui_preview_fill_camera_b = bool(mode == 'fill')
+        self.save_system_config()
+        self._apply_preview_mode(self.camera_b_display, mode)
+        mode_text = '填充' if mode == 'fill' else '适配'
+        self.append_runtime_event(f'普通相机 B 预览模式切换为：{mode_text}。', level='info')
+
+    def restore_window_geometry(self, default_size=(1560, 900)):
+        if not bool(getattr(self.config, 'ui_restore_window_geometry', True)):
+            return False
+        try:
+            width = int(getattr(self.config, 'ui_window_width', 0) or 0)
+            height = int(getattr(self.config, 'ui_window_height', 0) or 0)
+            if width < self.minimumWidth() or height < self.minimumHeight():
+                return False
+            self.resize(width, height)
+            x = int(getattr(self.config, 'ui_window_x', -1) or -1)
+            y = int(getattr(self.config, 'ui_window_y', -1) or -1)
+            if x >= 0 and y >= 0:
+                self.move(x, y)
+            return True
+        except Exception:
+            try:
+                self.resize(*default_size)
+            except Exception:
+                pass
+            return False
+
+    def persist_window_geometry(self):
+        try:
+            self.config.ui_window_width = int(self.width())
+            self.config.ui_window_height = int(self.height())
+            pos = self.pos()
+            self.config.ui_window_x = int(pos.x())
+            self.config.ui_window_y = int(pos.y())
+            if self.root_splitter is not None:
+                self.config.ui_root_splitter_sizes = [int(v) for v in self.root_splitter.sizes()]
+            if self.center_splitter is not None:
+                self.config.ui_center_splitter_sizes = [int(v) for v in self.center_splitter.sizes()]
+            self.save_system_config()
+        except Exception as exc:
+            self.append_runtime_event(f'保存窗口布局失败: {exc}', level='warn')
+
+    def restore_splitter_layout(self):
+        try:
+            root_sizes = list(getattr(self.config, 'ui_root_splitter_sizes', []) or [])
+            if self.root_splitter is not None and len(root_sizes) >= 2:
+                self.root_splitter.setSizes([max(120, int(v)) for v in root_sizes[:2]])
+            center_sizes = list(getattr(self.config, 'ui_center_splitter_sizes', []) or [])
+            if self.center_splitter is not None and len(center_sizes) >= 2:
+                self.center_splitter.setSizes([max(120, int(v)) for v in center_sizes[:2]])
+        except Exception as exc:
+            self.append_runtime_event(f'恢复窗口布局失败: {exc}', level='warn')
+
+    def reset_window_layout(self):
+        try:
+            self.apply_workspace_mode('总览四宫格', save=True)
+            mode_text = '紧凑标签页' if self.width() < 1500 else '全部展开'
+            self.control_panel_mode_combo.setCurrentText(mode_text)
+            self.apply_control_panel_mode(mode_text, save=True)
+            self.control_panel_scroll.setHidden(False)
+            self.config.ui_control_panel_hidden = False
+            if self.control_panel_toggle_btn is not None:
+                self.control_panel_toggle_btn.setText('隐藏设备面板')
+            if self.root_splitter is not None:
+                self.root_splitter.setSizes([max(880, int(self.width() * 0.7)), max(320, int(self.width() * 0.3))])
+            if self.center_splitter is not None:
+                self.center_splitter.setSizes([max(260, int(self.height() * 0.45)), max(260, int(self.height() * 0.55))])
+            self.persist_window_geometry()
+            self.append_runtime_event('窗口布局已恢复为推荐状态。', level='ok')
+        except Exception as exc:
+            self.append_runtime_event(f'恢复布局失败: {exc}', level='warn')
+
+    def toggle_event_log_visibility(self):
+        if self.event_log_group is None:
+            return
+        visible = not self.event_log_group.isVisible()
+        self.event_log_group.setVisible(visible)
+        if self.event_log_toggle_btn is not None:
+            self.event_log_toggle_btn.setText('隐藏运行日志' if visible else '显示运行日志')
+        self.config.ui_show_event_log = bool(visible)
+        self.save_system_config()
+
+    def refresh_quick_mode_buttons(self):
+        quick_bar_visible = bool(getattr(self.config, 'ui_show_quick_mode_bar', True))
+        for widget in [getattr(self, 'quick_mode_label', None)] + list(getattr(self, 'quick_mode_buttons', []) or []):
+            if widget is not None:
+                widget.setVisible(quick_bar_visible)
+        dual_enabled = bool(getattr(self.config, 'enable_camera_a_module', False))
+        workspace = str(getattr(self.config, 'ui_workspace_mode', 'overview'))
+        mapping = [
+            (getattr(self, 'quick_mode_normal_btn', None), not dual_enabled),
+            (getattr(self, 'quick_mode_dual_btn', None), dual_enabled),
+            (getattr(self, 'quick_view_overview_btn', None), workspace == 'overview'),
+            (getattr(self, 'quick_view_live_btn', None), workspace == 'live'),
+            (getattr(self, 'quick_view_measure_btn', None), workspace == 'measure'),
+        ]
+        for btn, checked in mapping:
+            if btn is None:
+                continue
+            btn.blockSignals(True)
+            btn.setChecked(bool(checked))
+            btn.blockSignals(False)
+
+    def run_startup_self_check(self):
+        issues = []
+        required_methods = [
+            '_camera_a_status_summary',
+            '_camera_b_status_summary',
+            'export_system_config_snapshot',
+            'import_system_config_snapshot',
+            'restore_default_system_config',
+            'open_model_config_dialog',
+        ]
+        for name in required_methods:
+            if not callable(getattr(self, name, None)):
+                issues.append(f'缺少方法 {name}')
+        required_widgets = [
+            'camera_a_display',
+            'camera_b_display',
+            'main_display',
+            'transform_display',
+            'status_cards_container',
+        ]
+        for name in required_widgets:
+            if getattr(self, name, None) is None:
+                issues.append(f'缺少控件 {name}')
+        if issues:
+            for msg in issues[:10]:
+                self.append_runtime_event(f'启动自检警告: {msg}', level='warn')
+        else:
+            self.append_runtime_event('启动自检通过：关键 UI 入口与状态摘要方法已就绪。', level='ok')
+
+    def _update_status_cards_layout(self, force=False):
+        if self.status_cards_layout is None:
+            return
+        if self.width() < 1320:
+            desired_cols = 2
+        elif self.width() < 1820:
+            desired_cols = 3
+        else:
+            desired_cols = 6
+        if not force and self.status_cards_columns == desired_cols:
+            return
+        while self.status_cards_layout.count():
+            item = self.status_cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(self.status_cards_container)
+        cards = [self.status_runtime_card, self.status_model_card, self.status_fps_card, self.status_save_card, self.status_camera_a_card, self.status_camera_b_card]
+        for idx, card in enumerate(cards):
+            if not card:
+                continue
+            row = idx // desired_cols
+            col = idx % desired_cols
+            self.status_cards_layout.addWidget(card['frame'], row, col)
+        for col in range(desired_cols):
+            self.status_cards_layout.setColumnStretch(col, 1)
+        self.status_cards_columns = desired_cols
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._mark_window_interacting('resize', duration_ms=180)
+        self._schedule_status_cards_layout_update(120)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._mark_window_interacting('move', duration_ms=120)
+
     def setup_model_config_dialog(self):
         self.refresh_config_summary()
+        self.refresh_runtime_strip()
 
     def refresh_config_summary(self):
         seg_path = getattr(self, 'onnx_model_path', '') or getattr(self.config, 'active_seg_model', '')
@@ -1015,9 +2091,330 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         preview_name = Path(self.yolo_model_path).name if getattr(self, 'yolo_model_path', '') else '无'
         realtime_text = '开启' if self.config.enable_realtime_segmentation else '关闭'
         mode_text = '紧凑设备面板' if self.config.ui_control_panel_mode == 'compact' else '展开设备面板'
-        summary = f'当前主检测模型：{seg_name} | 预览模型：{preview_name} | 实时检测：{realtime_text} | 设备面板：{mode_text}'
+        save_name = Path(self.filepath).name if getattr(self, 'filepath', '') else 'data'
+        workspace_text = {'overview': '四宫格', 'live': '实时优先', 'measure': '测量优先'}.get(str(getattr(self.config, 'ui_workspace_mode', 'overview')), '四宫格')
+        camera_mode_text = '双相机' if bool(getattr(self.config, 'enable_camera_a_module', False)) else '普通相机'
+        summary = f'当前主检测模型：{seg_name} | 预览模型：{preview_name} | 实时检测：{realtime_text} | 工作区：{workspace_text} | 设备面板：{mode_text} | 界面模式：{camera_mode_text} | 保存目录：{save_name}'
         if self.config_summary_label is not None:
             self.config_summary_label.setText(summary)
+
+    def _resolve_output_dir_value(self, output_dir):
+        output_dir = str(output_dir or '').strip()
+        if not output_dir:
+            output_dir = 'data'
+        path = Path(output_dir)
+        if not path.is_absolute():
+            path = Path(self.base_dir) / path
+        return str(path.resolve())
+
+    def _shorten_path(self, value, max_len=64):
+        value = str(value or '')
+        if len(value) <= max_len:
+            return value
+        keep = max(10, (max_len - 3) // 2)
+        return f"{value[:keep]}...{value[-keep:]}"
+
+    def rebuild_logger_for_output_dir(self):
+        self.logger = daily_logger.DailyLogger(log_dir=self.filepath, file_extension='csv')
+        self.logger.set_headers(["时间", "原始图片名", "结果图片名", "圆心位置", "裂缝宽度", "实际距离"])
+
+    def set_output_directory(self, output_dir, save_config=True, announce=True):
+        resolved = self._resolve_output_dir_value(output_dir)
+        self.filepath = resolved
+        self.debug_dir = os.path.join(self.filepath, 'debug')
+        os.makedirs(self.filepath, exist_ok=True)
+        os.makedirs(self.debug_dir, exist_ok=True)
+        self.calibration_file = os.path.join(self.filepath, 'calibration.json')
+        self.rebuild_logger_for_output_dir()
+        self.config.output_dir = resolved
+        if save_config:
+            self.save_system_config()
+        if self.session_output_dir_label is not None:
+            self.session_output_dir_label.setText(self._shorten_path(self.filepath, 72))
+        if self.dialog_output_dir_label is not None:
+            self.dialog_output_dir_label.setText(self._shorten_path(self.filepath, 56))
+        self.refresh_config_summary()
+        self.refresh_runtime_strip()
+        if announce:
+            self.update_model_status_label(f'结果保存目录已切换到: {resolved}')
+
+    def choose_output_directory(self):
+        current_dir = self.filepath if getattr(self, 'filepath', '') else self.data_root
+        selected = QFileDialog.getExistingDirectory(self, '选择结果保存目录', current_dir)
+        if selected:
+            self.set_output_directory(selected, save_config=True, announce=True)
+
+    def open_output_directory(self):
+        target = self.filepath if getattr(self, 'filepath', '') else self.data_root
+        os.makedirs(target, exist_ok=True)
+        url = QUrl.fromLocalFile(target)
+        if not QDesktopServices.openUrl(url):
+            try:
+                os.startfile(target)
+            except Exception:
+                QMessageBox.information(self, '提示', f'请手动打开目录:\n{target}')
+
+    def _apply_loaded_config(self, new_config, announce='配置已更新'):
+        if not isinstance(new_config, SystemConfig):
+            return False
+        new_config.use_cuda = bool(getattr(self, 'acceleration_info', {}).get('prefer_gpu', True))
+        self.config = new_config
+        self.setWindowTitle(getattr(self.config, 'app_display_name', 'Crack Detecttion - EatRice Studio'))
+        self.set_output_directory(getattr(self.config, 'output_dir', 'data'), save_config=False, announce=False)
+
+        try:
+            self.model_dir_input.setText(self.get_model_dir_path())
+        except Exception:
+            pass
+
+        try:
+            self.realtime_detect_checkbox.setChecked(bool(self.config.enable_realtime_segmentation))
+            self.auto_match_preview_checkbox.setChecked(bool(self.config.auto_match_preview_model))
+            self.max_fps_spin.setValue(int(getattr(self.config, 'max_preview_fps', 20)))
+            self.anti_shake_checkbox.setChecked(bool(getattr(self.config, 'anti_shake_enabled', False)))
+            self.motion_threshold_spin.setValue(int(round(float(getattr(self.config, 'anti_shake_motion_threshold', 8.0)))))
+            self.patrol_mode_checkbox.setChecked(bool(getattr(self.config, 'patrol_mode_enabled', False)))
+            self.patrol_interval_spin.setValue(int(round(float(getattr(self.config, 'patrol_auto_capture_interval_s', 3.0)))))
+            self.auto_scene_checkbox.setChecked(bool(getattr(self.config, 'auto_apply_scene_profile', True)))
+            self.laser_enable_checkbox.setChecked(bool(getattr(self.config, 'laser_enabled', False)))
+            baudrate = int(getattr(self.config, 'laser_baudrate', 9600))
+            self.laser_baudrate_input.setText(str(baudrate))
+            self.laser_baudrate_combo.setCurrentText(str(baudrate))
+            self.laser_hfov_input.setText(f"{float(getattr(self.config, 'camera_horizontal_fov_deg', 60.0)):.2f}")
+            laser_offset = float(getattr(self.config, 'laser_distance_offset_mm', 0.0))
+            self.laser_offset_input.setText(f"{laser_offset:.2f}")
+            self.laser_offset_spin.setText(f"{laser_offset:.2f}")
+            self.laser_command_input.setText(str(getattr(self.config, 'laser_command', '') or ''))
+
+            idx = self.measurement_mode_combo.findText(str(getattr(self.config, 'measurement_mode', 'calibration_first')))
+            if idx >= 0:
+                self.measurement_mode_combo.setCurrentIndex(idx)
+            idx = self.laser_unit_combo.findText(str(getattr(self.config, 'laser_unit', 'm')))
+            if idx >= 0:
+                self.laser_unit_combo.setCurrentIndex(idx)
+            if self.control_panel_mode_combo is not None:
+                idx = self.control_panel_mode_combo.findData(str(getattr(self.config, 'ui_control_panel_mode', 'compact')))
+                if idx >= 0:
+                    self.control_panel_mode_combo.setCurrentIndex(idx)
+            if self.workspace_mode_combo is not None:
+                idx = self.workspace_mode_combo.findData(str(getattr(self.config, 'ui_workspace_mode', 'overview')))
+                if idx >= 0:
+                    self.workspace_mode_combo.setCurrentIndex(idx)
+        except Exception:
+            pass
+
+        self.refresh_laser_ports()
+        self.refresh_model_registry(initial=True)
+        self.refresh_scene_profiles()
+        try:
+            self.apply_selected_models(initial=True, silent=False)
+        except Exception as exc:
+            self.update_model_status_label(f'配置应用后模型加载失败: {exc}')
+        self.sync_camera_mode_selector_widgets()
+        self.apply_control_panel_mode(str(getattr(self.config, 'ui_control_panel_mode', 'compact')), save_config=False)
+        self.apply_workspace_mode(str(getattr(self.config, 'ui_workspace_mode', 'overview')), save_config=False)
+        self.apply_camera_module_visibility(save=False, force_overview=not bool(getattr(self.config, 'enable_camera_a_module', False)))
+        if self.event_log_group is not None:
+            self.event_log_group.setVisible(bool(getattr(self.config, 'ui_show_event_log', True)))
+            if self.event_log_toggle_btn is not None:
+                self.event_log_toggle_btn.setText('隐藏运行日志' if self.event_log_group.isVisible() else '显示运行日志')
+        self.save_system_config()
+        self.refresh_config_summary()
+        self.refresh_runtime_strip()
+        if announce:
+            self.update_model_status_label(announce)
+        return True
+
+    def export_system_config_snapshot(self):
+        self.save_system_config()
+        default_name = f"system_config_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        default_path = os.path.join(self.filepath if getattr(self, 'filepath', '') else self.data_root, default_name)
+        target, _ = QFileDialog.getSaveFileName(self, '导出配置快照', default_path, 'JSON 文件 (*.json)')
+        if not target:
+            return
+        try:
+            with open(target, 'w', encoding='utf-8') as f:
+                json.dump(asdict(self.config), f, ensure_ascii=False, indent=2)
+            self.update_model_status_label(f'配置快照已导出: {target}')
+        except Exception as exc:
+            QMessageBox.critical(self, '导出配置失败', f'无法导出配置快照\n{exc}')
+
+    def import_system_config_snapshot(self):
+        source, _ = QFileDialog.getOpenFileName(self, '导入配置快照', self.filepath if getattr(self, 'filepath', '') else self.data_root, 'JSON 文件 (*.json)')
+        if not source:
+            return
+        try:
+            with open(source, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            new_config = SystemConfig()
+            for key, value in raw.items():
+                if hasattr(new_config, key):
+                    setattr(new_config, key, value)
+            self._apply_loaded_config(new_config, announce=f'配置已导入: {source}')
+        except Exception as exc:
+            QMessageBox.critical(self, '导入配置失败', f'无法导入配置快照\n{exc}')
+
+    def restore_default_system_config(self):
+        reply = QMessageBox.question(
+            self,
+            '恢复默认配置',
+            '确定要恢复默认配置吗？\n当前保存目录、模型选择和界面偏好会重置为默认值。',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        default_config = SystemConfig()
+        default_config.use_cuda = bool(getattr(self, 'acceleration_info', {}).get('prefer_gpu', True))
+        self._apply_loaded_config(default_config, announce='已恢复默认配置')
+
+    def refresh_runtime_strip(self):
+        runtime = self.acceleration_info.get('device_text', 'CPU') if hasattr(self, 'acceleration_info') else 'CPU'
+        realtime_text = '开启' if self.config.enable_realtime_segmentation else '关闭'
+        seg_name = Path(getattr(self, 'onnx_model_path', '') or getattr(self.config, 'active_seg_model', '') or '').name or '未加载'
+        preview_name = Path(getattr(self, 'yolo_model_path', '') or '').name or '无'
+        save_path_short = self._shorten_path(self.filepath, 56)
+
+        if self.runtime_strip_label is not None:
+            self.runtime_strip_label.setText(f'运行摘要：设备 {runtime} | 实时检测 {realtime_text} | 工业A抓取 {self.current_camera_a_grab_fps:.1f} FPS | 普通相机预览 {self.current_preview_fps:.1f} FPS | 推理 {self.current_inference_fps:.1f} FPS')
+        if self.output_dir_label is not None:
+            self.output_dir_label.setText(f'保存目录：{save_path_short}')
+
+        last_save_value = '最近保存：暂无'
+        last_save_subtitle = '当前尚未生成新的结果文件'
+        info = getattr(self, 'last_saved_artifacts', None) or {}
+        if info:
+            result_name = Path(str(info.get('result', ''))).name if info.get('result') else '无'
+            source_name = str(info.get('source', '') or 'unknown')
+            saved_at = str(info.get('saved_at', '') or '')
+            last_save_value = result_name
+            last_save_subtitle = f'来源 {source_name} | 时间 {saved_at} | 目录 {save_path_short}'
+            if self.last_save_label is not None:
+                self.last_save_label.setText(f'最近保存：{result_name} | 来源 {source_name} | 时间 {saved_at}')
+        elif getattr(self, 'last_camera_b_saved_files', None) and any(self.last_camera_b_saved_files):
+            org, out = self.last_camera_b_saved_files
+            result_name = Path(out).name if out else '无'
+            org_name = Path(org).name if org else '无'
+            last_save_value = result_name
+            last_save_subtitle = f'原图 {org_name} | 目录 {save_path_short}'
+            if self.last_save_label is not None:
+                self.last_save_label.setText(f'最近保存：{result_name} | 原图 {org_name}')
+        else:
+            if self.last_save_label is not None:
+                self.last_save_label.setText('最近保存：暂无')
+
+        runtime_state = 'ok' if 'GPU' in runtime.upper() else 'warn'
+        model_state = 'ok' if seg_name != '未加载' else 'danger'
+        if seg_name != '未加载' and preview_name in {'无', '未加载'}:
+            model_state = 'warn'
+        fps_state = 'danger'
+        if self.current_inference_fps >= 6.0 or self.current_preview_fps >= 15.0:
+            fps_state = 'ok'
+        elif self.current_inference_fps > 0.0 or self.current_preview_fps > 0.0 or self.current_camera_a_grab_fps > 0.0:
+            fps_state = 'warn'
+        save_state = 'ok' if info or (getattr(self, 'last_camera_b_saved_files', None) and any(self.last_camera_b_saved_files)) else 'info'
+
+        cam_a_fn = getattr(self, '_camera_a_status_summary', None)
+        cam_b_fn = getattr(self, '_camera_b_status_summary', None)
+        try:
+            cam_a_value, cam_a_subtitle, cam_a_state = cam_a_fn() if callable(cam_a_fn) else ('未就绪', '工业相机状态摘要方法缺失。', 'danger')
+        except Exception as exc:
+            cam_a_value, cam_a_subtitle, cam_a_state = '状态异常', f'工业相机状态读取失败: {exc}', 'danger'
+        if not bool(getattr(self.config, 'enable_camera_a_module', False)):
+            cam_a_value, cam_a_subtitle, cam_a_state = '已隐藏', '当前为普通相机模式，可在配置中切换到双相机模式。', 'info'
+        try:
+            cam_b_value, cam_b_subtitle, cam_b_state = cam_b_fn() if callable(cam_b_fn) else ('未就绪', '普通相机状态摘要方法缺失。', 'danger')
+        except Exception as exc:
+            cam_b_value, cam_b_subtitle, cam_b_state = '状态异常', f'普通相机状态读取失败: {exc}', 'danger'
+
+        self._set_status_card(self.status_runtime_card, runtime, f'实时检测 {realtime_text}', state=runtime_state)
+        self._set_status_card(self.status_model_card, seg_name, f'预览模型 {preview_name}', state=model_state)
+        self._set_status_card(self.status_fps_card, f'推理 {self.current_inference_fps:.1f} FPS', f'工业A抓取 {self.current_camera_a_grab_fps:.1f} | 普通相机预览 {self.current_preview_fps:.1f}', state=fps_state)
+        self._set_status_card(self.status_save_card, last_save_value, last_save_subtitle, state=save_state)
+        self._set_status_card(self.status_camera_a_card, cam_a_value, cam_a_subtitle, state=cam_a_state)
+        self._set_status_card(self.status_camera_b_card, cam_b_value, cam_b_subtitle, state=cam_b_state)
+
+    def _camera_a_status_summary(self):
+        if not getattr(self, 'cameraA', None):
+            return '未初始化', '工业相机控制器尚未创建', 'danger'
+        opened = False
+        try:
+            opened = bool(getattr(self.cameraA, 'b_open_device', False))
+        except Exception:
+            opened = False
+        if not opened:
+            return '未打开', '请先查找并打开工业相机 A', 'info'
+
+        preview_frame = None
+        frame_shape = None
+        try:
+            getter = getattr(self.cameraA, 'get_latest_preview_frame', None)
+            if callable(getter):
+                preview_frame = getter()
+        except Exception:
+            preview_frame = None
+        if preview_frame is not None and hasattr(preview_frame, 'shape') and len(preview_frame.shape) >= 2:
+            frame_shape = preview_frame.shape
+        elif getattr(self, 'frame_a', None) is not None and hasattr(self.frame_a, 'shape'):
+            frame_shape = self.frame_a.shape
+
+        res_text = '无预览帧'
+        if frame_shape is not None:
+            try:
+                h, w = int(frame_shape[0]), int(frame_shape[1])
+                res_text = f'{w}x{h}'
+            except Exception:
+                res_text = '分辨率未知'
+
+        display_mode = '填充显示' if bool(getattr(self.config, 'ui_preview_fill_camera_a', False)) else '完整适配'
+        if frame_shape is not None:
+            value = '已连接 / 有帧'
+            subtitle = f'预览 {res_text} | 抓取 {self.current_camera_a_grab_fps:.1f} FPS | 显示 {self.current_camera_a_display_fps:.1f} FPS | {display_mode}'
+            state = 'ok' if self.current_camera_a_grab_fps > 0.0 else 'warn'
+            return value, subtitle, state
+        value = '已连接 / 等待帧'
+        subtitle = f'暂未收到有效预览帧 | {display_mode}'
+        return value, subtitle, 'warn'
+
+    def _camera_b_status_summary(self):
+        camera_open = getattr(self, 'camera_b', None) is not None and bool(getattr(self, 'is_running_b', False))
+        backend_name = self.backend_name(getattr(self, 'current_camera_b_backend', None)) if hasattr(self, 'backend_name') else 'AUTO'
+        index_text = '未选择'
+        try:
+            if getattr(self, 'camera_b_combo_box', None) is not None:
+                idx = self.camera_b_combo_box.currentData()
+                if idx is not None:
+                    index_text = str(idx)
+        except Exception:
+            pass
+        if hasattr(self, 'current_device_index') and getattr(self, 'current_device_index', None) is not None:
+            index_text = str(getattr(self, 'current_device_index'))
+
+        frame_shape = None
+        if getattr(self, 'frame_b', None) is not None and hasattr(self.frame_b, 'shape'):
+            frame_shape = self.frame_b.shape
+        res_text = '无预览帧'
+        if frame_shape is not None:
+            try:
+                h, w = int(frame_shape[0]), int(frame_shape[1])
+                res_text = f'{w}x{h}'
+            except Exception:
+                res_text = '分辨率未知'
+
+        if camera_open and frame_shape is not None:
+            value = '已连接 / 有帧'
+            subtitle = f'索引 {index_text} | {backend_name} | 预览 {res_text} | {self.current_preview_fps:.1f} FPS'
+            state = 'ok' if self.current_preview_fps > 0.0 else 'warn'
+            return value, subtitle, state
+        if camera_open:
+            value = '已连接 / 等待帧'
+            subtitle = f'索引 {index_text} | {backend_name} | 尚未读取到有效视频帧'
+            return value, subtitle, 'warn'
+        discovered = len(getattr(self, 'available_cameras', []) or [])
+        value = '未打开'
+        subtitle = f'最近搜索发现 {discovered} 个设备 | 当前选择索引 {index_text}'
+        state = 'info' if discovered > 0 else 'danger'
+        return value, subtitle, state
 
     def on_startup_config_toggle_changed(self, checked):
         self.config.ui_show_model_config_on_startup = bool(checked)
@@ -1038,6 +2435,42 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         dialog.raise_()
         dialog.activateWindow()
         return QDialog.Accepted
+
+    def open_startup_device_mode_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('选择启动设备模式')
+        dialog.setModal(True)
+        dialog.resize(520, 260)
+        root = QVBoxLayout()
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+        title = QLabel('请选择本次需要启用的设备模式')
+        title.setStyleSheet('font-size:18px; font-weight:700; color:#1f2937;')
+        hint = QLabel('普通相机 B 为必选。若本次仅需普通相机，可使用“普通相机模式”；若需要工业相机抓拍与最终测量，再选择“双相机模式”。')
+        hint.setWordWrap(True)
+        normal_radio = QRadioButton('普通相机模式（推荐）')
+        dual_radio = QRadioButton('双相机模式（普通 + 工业）')
+        dual_enabled = bool(getattr(self.config, 'enable_camera_a_module', False))
+        dual_radio.setChecked(dual_enabled)
+        normal_radio.setChecked(not dual_enabled)
+        root.addWidget(title)
+        root.addWidget(hint)
+        root.addWidget(normal_radio)
+        root.addWidget(dual_radio)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        ok_btn = QPushButton('进入拍摄界面')
+        cancel_btn = QPushButton('退出程序')
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        row.addWidget(cancel_btn)
+        row.addWidget(ok_btn)
+        root.addLayout(row)
+        dialog.setLayout(root)
+        result = dialog.exec()
+        if result == QDialog.Accepted:
+            self.on_camera_interface_mode_changed(enable_camera_a=dual_radio.isChecked(), save=True, force_overview=not dual_radio.isChecked())
+        return result
 
     def get_window_size(self):
         window_size = self.size()
@@ -1064,6 +2497,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             'transform': self.transform_display,
         }
         self.display_label_keys = {id(label): key for key, label in mapping.items()}
+        self.display_labels_by_key = dict(mapping)
         title_map = {
             'camera_a': '工业相机 A 预览（双击放大）',
             'camera_b': '普通相机 B 预览（双击放大）',
@@ -1135,6 +2569,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                 self.control_panel_scroll.setMinimumWidth(340)
         self.config.ui_control_panel_mode = 'compact' if compact else 'expanded'
         self.refresh_config_summary()
+        self.refresh_quick_mode_buttons()
         if save:
             self.save_system_config()
 
@@ -1152,6 +2587,56 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             self.root_splitter.setSizes([max(920, self.width() - self.control_panel_scroll.minimumWidth()), self.control_panel_scroll.minimumWidth()])
         self.refresh_config_summary()
         self.save_system_config()
+
+    def apply_workspace_mode(self, mode_text, save=True):
+        mode_map = {
+            '总览四宫格': 'overview',
+            '实时优先': 'live',
+            '测量优先': 'measure',
+            'overview': 'overview',
+            'live': 'live',
+            'measure': 'measure',
+        }
+        mode = mode_map.get(str(mode_text), 'overview')
+        if self.live_group is None or self.analysis_group is None or self.center_splitter is None:
+            return
+        self.live_group.setVisible(True)
+        self.analysis_group.setVisible(True)
+        if mode == 'live':
+            self.analysis_group.hide()
+            self.center_splitter.setSizes([max(520, self.height() - 260), 0])
+            self.append_runtime_event('工作区已切换到“实时优先”。', level='info')
+        elif mode == 'measure':
+            self.live_group.hide()
+            self.center_splitter.setSizes([0, max(520, self.height() - 260)])
+            self.append_runtime_event('工作区已切换到“测量优先”。', level='info')
+        else:
+            self.center_splitter.setSizes([max(250, int(self.height() * 0.44)), max(260, int(self.height() * 0.46))])
+            self.append_runtime_event('工作区已切换到“四宫格总览”。', level='info')
+        self.config.ui_workspace_mode = mode
+        self.refresh_config_summary()
+        self.refresh_quick_mode_buttons()
+        if save:
+            self.save_system_config()
+
+    def on_workspace_mode_changed(self, text):
+        self.apply_workspace_mode(text, save=True)
+
+    def setup_shortcuts(self):
+        self.shortcut_open_config = QShortcut(QKeySequence('Ctrl+,'), self)
+        self.shortcut_open_config.activated.connect(self.open_model_config_dialog)
+        self.shortcut_overview = QShortcut(QKeySequence('F5'), self)
+        self.shortcut_overview.activated.connect(lambda: self.workspace_mode_combo.setCurrentText('总览四宫格'))
+        self.shortcut_live = QShortcut(QKeySequence('F6'), self)
+        self.shortcut_live.activated.connect(lambda: self.workspace_mode_combo.setCurrentText('实时优先'))
+        self.shortcut_measure = QShortcut(QKeySequence('F7'), self)
+        self.shortcut_measure.activated.connect(lambda: self.workspace_mode_combo.setCurrentText('测量优先'))
+        self.shortcut_toggle_device_mode = QShortcut(QKeySequence('Ctrl+M'), self)
+        self.shortcut_toggle_device_mode.activated.connect(lambda: self.on_camera_interface_mode_changed(enable_camera_a=not bool(getattr(self.config, 'enable_camera_a_module', False)), save=True, force_overview=bool(getattr(self.config, 'enable_camera_a_module', False))))
+        self.shortcut_log = QShortcut(QKeySequence('Ctrl+L'), self)
+        self.shortcut_log.activated.connect(self.toggle_event_log_visibility)
+
+
 
 
     def reset_preview_stabilization(self):
@@ -1234,6 +2719,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.capture_b_btn.clicked.connect(self.capture_image_b)
         self.find_a_btn.clicked.connect(self.find_devices_a)
         self.find_b_btn.clicked.connect(self.find_devices_b)
+        self.diagnose_b_btn.clicked.connect(self.open_camera_b_diagnostics)
         self.save_a_btn.clicked.connect(self.save_result_a)
         self.save_b_btn.clicked.connect(self.save_result_b)
         self.model_scan_btn.clicked.connect(self.on_scan_models_clicked)
@@ -1319,6 +2805,42 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         print(f"[Runtime] ONNX providers: {', '.join(info['onnx_providers']) if info['onnx_providers'] else 'None'}")
         return info
 
+    def _resolve_camera_backend_name(self, value):
+        name = str(value or '').strip().upper()
+        if not name:
+            return 'DSHOW'
+        return 'MSMF' if 'MSMF' in name else ('AUTO' if 'AUTO' in name or 'ANY' in name else 'DSHOW')
+
+    def _opencv_log_error_level(self):
+        try:
+            return int(cv2.utils.logging.LOG_LEVEL_ERROR)
+        except Exception:
+            return None
+
+    @contextmanager
+    def _suppress_opencv_videoio_warnings(self):
+        if not bool(getattr(self.config, 'camera_search_suppress_opencv_warnings', True)):
+            yield
+            return
+        old_level = None
+        changed = False
+        try:
+            if hasattr(cv2, 'utils') and hasattr(cv2.utils, 'logging') and hasattr(cv2.utils.logging, 'setLogLevel'):
+                old_level = cv2.utils.logging.getLogLevel()
+                level = self._opencv_log_error_level()
+                if level is not None:
+                    cv2.utils.logging.setLogLevel(level)
+                    changed = True
+        except Exception:
+            changed = False
+        try:
+            yield
+        finally:
+            if changed:
+                try:
+                    cv2.utils.logging.setLogLevel(old_level)
+                except Exception:
+                    pass
 
 
 
@@ -1327,19 +2849,46 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
 
 
 
-    def open_video_capture(self, index_or_source):
-        backend_candidates = []
+
+    def iter_camera_probe_backends(self, source, include_any=True):
+        if not isinstance(source, int):
+            return [cv2.CAP_ANY]
+        candidates = []
+        cached_backend = self.camera_probe_backend_cache.get(int(source))
+        preferred_order = [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+        if cached_backend is not None:
+            preferred_order = [cached_backend] + [backend for backend in preferred_order if backend != cached_backend]
+        for backend in preferred_order:
+            if backend not in candidates:
+                candidates.append(backend)
+        if include_any and cv2.CAP_ANY not in candidates:
+            candidates.append(cv2.CAP_ANY)
+        return candidates
+
+    def open_video_capture(self, index_or_source, probe_mode=False, min_reads=None, include_any=None, backend_candidates_override=None, allow_fallback=True):
         if isinstance(index_or_source, int) or (isinstance(index_or_source, str) and str(index_or_source).isdigit()):
             source = int(index_or_source)
-            backend_candidates = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+            if backend_candidates_override is not None:
+                backend_candidates = list(backend_candidates_override)
+            else:
+                if include_any is None:
+                    include_any = not (probe_mode and bool(getattr(self.config, 'camera_search_disable_cap_any_probe', True)))
+                backend_candidates = self.iter_camera_probe_backends(source, include_any=include_any)
+                if not allow_fallback and backend_candidates:
+                    backend_candidates = backend_candidates[:1]
         else:
             source = index_or_source
-            backend_candidates = [cv2.CAP_ANY]
+            backend_candidates = list(backend_candidates_override) if backend_candidates_override is not None else [cv2.CAP_ANY]
+            include_any = True
+
+        validation_reads = int(min_reads or (getattr(self.config, 'camera_search_probe_reads', 1) if probe_mode else 2))
+        read_delay_s = (float(getattr(self.config, 'camera_search_probe_delay_ms', 2)) / 1000.0) if probe_mode else 0.02
 
         for backend in backend_candidates:
             cap = None
             try:
-                cap = cv2.VideoCapture(source, backend) if backend != cv2.CAP_ANY else cv2.VideoCapture(source)
+                with self._suppress_opencv_videoio_warnings():
+                    cap = cv2.VideoCapture(source, backend) if backend != cv2.CAP_ANY else cv2.VideoCapture(source)
                 if cap is None or not cap.isOpened():
                     if cap is not None:
                         cap.release()
@@ -1348,16 +2897,29 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception:
                     pass
-                # 读取几帧验证后端确实可用，避免“已打开但没有图像”
+
                 ok = False
-                for _ in range(3):
+                for _ in range(max(1, validation_reads)):
                     ret, frame = cap.read()
                     if ret and frame is not None and frame.size > 0:
                         ok = True
                         break
-                    time.sleep(0.03)
+                    if read_delay_s > 0:
+                        time.sleep(read_delay_s)
+
                 if ok:
+                    if isinstance(source, int):
+                        self.camera_probe_backend_cache[int(source)] = backend
                     return cap, backend
+
+                if probe_mode:
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    if width > 0 or height > 0 or fps > 0:
+                        if isinstance(source, int):
+                            self.camera_probe_backend_cache[int(source)] = backend
+                        return cap, backend
                 cap.release()
             except Exception:
                 try:
@@ -1367,25 +2929,26 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                     pass
         return None, None
 
-    def probe_camera_index(self, index):
-        cap, backend = self.open_video_capture(index)
+    def probe_camera_index(self, index, preferred_backend=None, allow_fallback=True, include_any=None):
+        backends = None
+        if preferred_backend is not None:
+            backends = [preferred_backend]
+        cap, backend = self.open_video_capture(index, probe_mode=True, min_reads=1, include_any=include_any, backend_candidates_override=backends, allow_fallback=allow_fallback)
         if cap is None:
             return None
         try:
-            ok, frame = cap.read()
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-            if (not ok) and (width <= 0 or height <= 0):
+            if width <= 0 and height <= 0 and fps <= 0.0:
                 return None
-            if ok and frame is not None:
-                height, width = frame.shape[:2]
             return {
                 'index': int(index),
                 'backend': backend,
                 'width': int(width),
                 'height': int(height),
                 'fps': float(fps),
+                'probe_ok': True,
             }
         finally:
             cap.release()
@@ -1397,6 +2960,103 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             cv2.CAP_ANY: 'AUTO',
         }
         return mapping.get(backend, str(backend))
+
+    def open_camera_b_diagnostics(self):
+        dialog = getattr(self, '_camera_b_diag_dialog', None)
+        if dialog is None:
+            dialog = CameraSearchDiagnosticDialog(self)
+            self._camera_b_diag_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def start_camera_b_diagnostics(self, dialog):
+        if getattr(self, '_camera_b_diag_busy', False):
+            return
+        self._camera_b_diag_busy = True
+
+        def worker():
+            max_index = max(1, int(getattr(self.config, 'camera_search_extended_max_index', 12)))
+            rows = []
+            report_lines = []
+            start_all = time.time()
+            for index in range(max_index):
+                row_group = self.probe_camera_index_detailed(index)
+                rows.extend(row_group)
+                for row in row_group:
+                    status = row.get('status_text', '')
+                    msg = row.get('message', '')
+                    report_lines.append(
+                        f"index={row.get('index')} backend={row.get('backend_name')} status={status} frame={row.get('probe_ok')} "
+                        f"res={row.get('resolution_text')} fps={row.get('fps_text')} elapsed={row.get('elapsed_ms_text')} note={msg}"
+                    )
+            elapsed = time.time() - start_all
+            found = [row for row in rows if row.get('probe_ok')]
+            summary = f'诊断完成：扫描 0-{max_index - 1}，耗时 {elapsed:.2f}s，发现可读帧设备 {len(found)} 个。'
+            report_text = '\n'.join(report_lines)
+
+            def apply(rows=rows, summary=summary, report_text=report_text):
+                for row in rows:
+                    dialog.append_row(row)
+                dialog.finish_report(summary, report_text)
+                self._camera_b_diag_busy = False
+
+            self.run_on_ui(apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def probe_camera_index_detailed(self, index):
+        backends = self.iter_camera_probe_backends(index, include_any=True)
+        rows = []
+        min_reads = int(getattr(self.config, 'camera_search_probe_reads', 1) or 1)
+        for backend in backends:
+            row = {
+                'index': int(index),
+                'backend': backend,
+                'backend_name': self.backend_name(backend),
+                'probe_ok': False,
+                'width': 0,
+                'height': 0,
+                'fps': 0.0,
+                'message': '',
+            }
+            cap = None
+            t0 = time.time()
+            try:
+                backends = [backend]
+                cap, used_backend = self.open_video_capture(index, probe_mode=True, min_reads=min_reads, include_any=(backend == cv2.CAP_ANY), backend_candidates_override=backends, allow_fallback=False)
+                if cap is not None:
+                    row['backend'] = used_backend
+                    row['backend_name'] = self.backend_name(used_backend)
+                    ok, frame = cap.read()
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    if ok and frame is not None and frame.size > 0:
+                        row['probe_ok'] = True
+                        height, width = frame.shape[:2]
+                    row['width'] = width
+                    row['height'] = height
+                    row['fps'] = fps
+                    row['message'] = '可打开' if row['probe_ok'] else '可打开但暂未读到有效帧'
+                    row['status_text'] = '成功' if row['probe_ok'] else '部分成功'
+                else:
+                    row['message'] = '无法打开'
+                    row['status_text'] = '失败'
+            except Exception as exc:
+                row['message'] = str(exc)
+                row['status_text'] = '异常'
+            finally:
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+            row['resolution_text'] = f"{row['width']}x{row['height']}" if row['width'] or row['height'] else '-'
+            row['fps_text'] = f"{row['fps']:.2f}" if row['fps'] else '-'
+            row['elapsed_ms_text'] = f"{(time.time() - t0) * 1000.0:.1f}"
+            rows.append(row)
+        return rows
 
 
 
@@ -1541,7 +3201,13 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.measurement_mode_combo.blockSignals(False)
         self.laser_hfov_input.setText(f"{float(self.config.camera_horizontal_fov_deg):.2f}")
         self.laser_offset_input.setText(f"{float(self.config.laser_distance_offset_mm):.2f}")
+        if hasattr(self, 'laser_offset_spin'):
+            self.laser_offset_spin.setText(f"{float(self.config.laser_distance_offset_mm):.2f}")
         self.laser_baudrate_input.setText(str(int(self.config.laser_baudrate)))
+        if hasattr(self, 'laser_baudrate_combo'):
+            self.laser_baudrate_combo.setCurrentText(str(int(self.config.laser_baudrate)))
+        if hasattr(self, 'laser_command_input'):
+            self.laser_command_input.setText(str(getattr(self.config, 'laser_command', '') or ''))
         self.laser_enable_checkbox.setChecked(bool(self.config.laser_enabled))
         unit_idx = self.laser_unit_combo.findText(self.config.laser_unit)
         if unit_idx >= 0:
@@ -1593,18 +3259,32 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.save_system_config()
 
     def _sync_laser_config_inputs(self):
+        baud_widget = getattr(self, 'laser_baudrate_combo', None)
+        baud_text = baud_widget.currentText().strip() if baud_widget is not None else self.laser_baudrate_input.text().strip()
         try:
-            self.config.laser_baudrate = int(float(self.laser_baudrate_input.text().strip() or self.config.laser_baudrate))
+            self.config.laser_baudrate = int(float(baud_text or self.config.laser_baudrate))
         except Exception:
             pass
         try:
             self.config.camera_horizontal_fov_deg = float(self.laser_hfov_input.text().strip() or self.config.camera_horizontal_fov_deg)
         except Exception:
             pass
+        offset_widget = getattr(self, 'laser_offset_spin', None)
+        offset_text = offset_widget.text().strip() if offset_widget is not None else self.laser_offset_input.text().strip()
         try:
-            self.config.laser_distance_offset_mm = float(self.laser_offset_input.text().strip() or self.config.laser_distance_offset_mm)
+            self.config.laser_distance_offset_mm = float(offset_text or self.config.laser_distance_offset_mm)
         except Exception:
             pass
+        if hasattr(self, 'laser_offset_input'):
+            self.laser_offset_input.setText(f"{float(self.config.laser_distance_offset_mm):.2f}")
+        if hasattr(self, 'laser_offset_spin'):
+            self.laser_offset_spin.setText(f"{float(self.config.laser_distance_offset_mm):.2f}")
+        if hasattr(self, 'laser_baudrate_input'):
+            self.laser_baudrate_input.setText(str(int(self.config.laser_baudrate)))
+        if hasattr(self, 'laser_baudrate_combo'):
+            self.laser_baudrate_combo.setCurrentText(str(int(self.config.laser_baudrate)))
+        if hasattr(self, 'laser_command_input'):
+            self.config.laser_command = self.laser_command_input.text().strip()
         self.config.measurement_mode = self.measurement_mode_combo.currentText()
         self.config.laser_unit = self.laser_unit_combo.currentText()
 
@@ -1876,6 +3556,10 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         key = self.display_label_keys.get(id(label)) if hasattr(self, 'display_label_keys') else None
         if key is not None:
             self.latest_display_images[key] = display_img
+        if bool(label.property('fast_display')) and time.time() < float(getattr(self, '_suspend_live_repaint_until', 0.0)):
+            if key is not None:
+                self._deferred_display_keys.add(key)
+            return
         target_size = label.size()
         target_w = max(1, target_size.width())
         target_h = max(1, target_size.height())
@@ -1928,10 +3612,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         label.setPixmap(QPixmap.fromImage(q_img))
         if self.zoom_dialog is not None and self.zoom_dialog.isVisible() and key is not None and self.current_zoom_key == key:
             current_title = self.zoom_dialog.windowTitle()
-            try:
-                self.zoom_dialog.update_live_image(display_img, current_title)
-            except Exception:
-                self.zoom_dialog.set_image(display_img, current_title)
+            self._queue_zoom_dialog_update(display_img, current_title)
 
     # 查找摄像头b
 
@@ -2049,6 +3730,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         )
         if reply == QMessageBox.Yes:
             try:
+                self.persist_window_geometry()
                 self.realtime_worker_stop = True
                 self.realtime_worker_event.set()
                 self.is_running_b = False
@@ -2118,10 +3800,14 @@ if __name__ == "__main__":
     """)
 
     window = CameraGUI()
-    window.setWindowTitle(f'Crack Vision System {APP_VERSION}')
+    window.setWindowTitle(getattr(window.config, 'app_display_name', 'Crack Detecttion - EatRice Studio'))
     if getattr(window.config, 'ui_show_model_config_on_startup', True):
         startup_result = window.open_model_config_dialog(startup=True)
         if startup_result != QDialog.Accepted:
+            sys.exit(0)
+    elif getattr(window.config, 'startup_choose_camera_mode', True):
+        mode_result = window.open_startup_device_mode_dialog()
+        if mode_result != QDialog.Accepted:
             sys.exit(0)
     window.show()
 

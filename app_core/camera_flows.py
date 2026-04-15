@@ -328,9 +328,7 @@ class CameraFlowMixin:
             self.camera_b_connection.setEnabled(True)
             self.camera_b_display.setText("相机B已停止")
             self.main_display.setText("等待图像输入...")
-            self.seg_display.setText("等待图像获取")
-            self.transform_display.setText("变换结果")
-            self.final_display.setText("最终结果")
+            self.transform_display.setText("普通相机B实时裂缝阴影遮罩")
             self.latest_realtime_overlay = None
             self.latest_realtime_result = None
             self.latest_stable_mask_visual = None
@@ -420,28 +418,85 @@ class CameraFlowMixin:
                     time.sleep(remain)
             else:
                 time.sleep(0.001)
-
-
     def capture_image_b(self):
-        if self.frame_b is not None:
-            if self.deal_picture_flag:
-                QMessageBox.warning(self, "错误", "当前已有图像正在处理中，请稍后尝试！")
-                return
-            try:
-                self.deal_picture_flag = 1
-                self.picturename_b = time.strftime("CamB_capture_%Y%m%d_%H%M%S.jpg")
-                self.frame_b_capture = self._ensure_bgr_frame(self.frame_b.copy())
-                self.last_source_label = 'camera_b'
-                self.display_image(self.frame_b_capture, self.seg_display)
-                self.picture_deal(self.frame_b_capture, None, 'b')
-                self.save_b_btn.setEnabled(True)
-            finally:
-                self.deal_picture_flag = 0
-        else:
+        frame = self.frame_b.copy() if self.frame_b is not None else None
+        if frame is None or frame.size == 0:
             self.frame_b_capture = None
             self.picturename_b = None
-            self.main_display.setText("获取图像失败")
+            self.update_model_status_label('普通相机B抓拍失败：当前没有可用视频帧。')
             self.save_b_btn.setEnabled(False)
+            return
+        if getattr(self, 'camera_b_capture_busy', False):
+            self.update_model_status_label('普通相机B正在保存上一张抓拍结果，请稍候。')
+            return
+
+        self.camera_b_capture_busy = True
+        self.capture_b_btn.setEnabled(False)
+        frame = self._ensure_bgr_frame(frame)
+        self.frame_b_capture = frame.copy()
+        self.picturename_b = time.strftime("CamB_capture_%Y%m%d_%H%M%S.jpg")
+        self.last_source_label = 'camera_b'
+        self.update_model_status_label('普通相机B正在后台保存抓拍图像与检测结果...')
+        worker = threading.Thread(target=self._capture_and_save_camera_b_snapshot, args=[self.frame_b_capture.copy(), self.picturename_b], daemon=True)
+        worker.start()
+
+
+    def _capture_and_save_camera_b_snapshot(self, frame, picture_name):
+        detection_result = None
+        org_filename = ''
+        out_filename = ''
+        try:
+            binary_mask, mask_visual, infer_ms = self.run_segmentation_inference(frame, source_label='camera_b')
+            if binary_mask is None:
+                binary_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+            binary_mask = self.ensure_binary_mask(binary_mask) if binary_mask is not None else np.zeros(frame.shape[:2], dtype=np.uint8)
+            has_crack = bool(binary_mask is not None and np.count_nonzero(binary_mask) > 0)
+            overlay = self.render_detection_output(frame, None, None, None, '未标定', binary_mask=binary_mask, fast_mode=False)
+            detection_result = DetectionResult(
+                valid=has_crack,
+                center=(0, 0),
+                width_px=0.0,
+                actual_distance_mm=None,
+                mask_visual=mask_visual if has_crack else None,
+                output_image=overlay,
+                inference_ms=float(infer_ms),
+                postprocess_ms=0.0,
+                note='camera_b_auto_saved_snapshot',
+                measurement_source='未标定',
+            )
+            self.final_result_b = overlay
+            self.last_detection_result_b = detection_result
+            org_filename, out_filename = self.save_detection_artifacts(frame, picture_name, overlay, detection_result, 'camera_b')
+            self.last_camera_b_saved_files = (org_filename, out_filename)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.logger.log({
+                "时间": timestamp,
+                "原始图片名": org_filename,
+                "结果图片名": out_filename,
+                "圆心位置": '自动保存（普通相机B）',
+                "裂缝宽度": '未计算',
+                "实际距离": '未计算',
+            })
+
+            def apply_saved_result(has_crack_flag=has_crack, org=org_filename, out=out_filename):
+                self.save_b_btn.setEnabled(True)
+                self.camera_b_position.setText('自动保存')
+                self.camera_b_width.setText('未计算')
+                self.camera_b_distance.setText('未计算')
+                msg = f'普通相机B已自动保存原图和检测结果。\n原图: {org}\n结果: {out}'
+                if not has_crack_flag:
+                    msg += '\n说明: 当前抓拍未检测到明显裂缝，结果图为原图叠加空掩膜。'
+                self.update_model_status_label(msg)
+            self.run_on_ui(apply_saved_result)
+        except Exception as exc:
+            traceback.print_exc()
+            err_msg = f'普通相机B抓拍保存失败: {exc}'
+            self.run_on_ui(lambda msg=err_msg: QMessageBox.critical(self, '普通相机B抓拍失败', msg))
+        finally:
+            def finish_capture():
+                self.camera_b_capture_busy = False
+                self.capture_b_btn.setEnabled(self.camera_b is not None and self.is_running_b)
+            self.run_on_ui(finish_capture)
 
 
     def picture_deal(self, image, skeleton, camara_index):
@@ -603,26 +658,51 @@ class CameraFlowMixin:
     def find_devices_b(self):
         if self.device_search_busy_b:
             return
-        self.device_search_cache_b = {'timestamp': 0.0, 'devices': []}
+        self.device_search_force_refresh_b = True
         self.device_search_busy_b = True
         self.find_b_btn.setEnabled(False)
+        try:
+            self.diagnose_b_btn.setEnabled(False)
+        except Exception:
+            pass
         self.open_close_b_btn.setEnabled(False)
-        self.camera_b_display.setText("正在查找USB/本机视频设备...")
+        self.camera_b_display.setText("正在快速查找USB/本机视频设备...")
         self.camera_b_combo_box.clear()
         threading.Thread(target=self._find_devices_b_worker, daemon=True).start()
 
 
     def _find_devices_b_worker(self):
         try:
-            cache_ttl = float(getattr(self.config, 'camera_search_cache_ttl_s', 3.0))
+            cache_ttl = float(getattr(self.config, 'camera_search_cache_ttl_s', 1.5))
             now = time.time()
-            if self.device_search_cache_b['devices'] and (now - self.device_search_cache_b['timestamp']) < cache_ttl:
+            force_refresh = bool(getattr(self, 'device_search_force_refresh_b', False))
+            used_cache = False
+            if (not force_refresh) and self.device_search_cache_b['devices'] and (now - self.device_search_cache_b['timestamp']) < cache_ttl:
                 devices = list(self.device_search_cache_b['devices'])
+                scan_seconds = 0.0
+                scanned_max_index = max((dev.get('index', -1) for dev in devices), default=-1) + 1
+                used_cache = True
             else:
-                def scan_indices(max_index):
+                primary_max = max(1, int(getattr(self.config, 'camera_search_max_index', 6)))
+                extended_max = max(primary_max, int(getattr(self.config, 'camera_search_extended_max_index', 12)))
+                target_count = max(1, int(getattr(self.config, 'camera_search_target_count', 2)))
+                primary_workers = max(1, min(int(getattr(self.config, 'camera_search_max_workers', 2)), primary_max))
+                fallback_workers = max(1, min(int(getattr(self.config, 'camera_search_max_workers_fallback', 1)), extended_max))
+                preferred_name = self._resolve_camera_backend_name(getattr(self.config, 'camera_search_preferred_backend', 'DSHOW'))
+                preferred_backend = cv2.CAP_DSHOW if preferred_name == 'DSHOW' else (cv2.CAP_MSMF if preferred_name == 'MSMF' else cv2.CAP_ANY)
+                fallback_backend = cv2.CAP_MSMF if preferred_backend == cv2.CAP_DSHOW else cv2.CAP_DSHOW
+                scan_start = time.time()
+
+                def scan_indices(indices, backend=None, workers=1, allow_fallback=False, include_any=False):
+                    indices = list(indices)
+                    if not indices:
+                        return []
                     found = []
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max_index)) as executor:
-                        future_map = {executor.submit(self.probe_camera_index, index): index for index in range(max_index)}
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(workers, len(indices)))) as executor:
+                        future_map = {
+                            executor.submit(self.probe_camera_index, index, preferred_backend=backend, allow_fallback=allow_fallback, include_any=include_any): index
+                            for index in indices
+                        }
                         for future in concurrent.futures.as_completed(future_map):
                             try:
                                 result = future.result()
@@ -634,11 +714,62 @@ class CameraFlowMixin:
                     found.sort(key=lambda item: item['index'])
                     return found
 
-                max_index = max(1, int(getattr(self.config, 'camera_search_max_index', 6)))
-                devices = scan_indices(max_index)
-                if not devices and max_index < 10:
-                    devices = scan_indices(10)
-                self.device_search_cache_b = {'timestamp': now, 'devices': devices}
+                devices_by_index = {}
+                scanned_indices = set()
+
+                primary_indices = list(range(0, primary_max))
+                primary_devices = scan_indices(primary_indices, backend=preferred_backend, workers=primary_workers, allow_fallback=False, include_any=False)
+                for dev in primary_devices:
+                    devices_by_index[int(dev['index'])] = dev
+                scanned_indices.update(primary_indices)
+                scanned_max_index = primary_max
+
+                def apply_intermediate(found_devices=None, scanned=primary_max):
+                    found_devices = list(found_devices or [])
+                    self.camera_b_combo_box.clear()
+                    self.available_cameras = []
+                    if found_devices:
+                        for dev in found_devices:
+                            backend_name = self.backend_name(dev.get('backend'))
+                            camera_info = f"Camera {dev['index']} ({dev['width']}x{dev['height']}, {dev['fps']:.2f}fps, {backend_name})"
+                            self.camera_b_combo_box.addItem(camera_info, userData=dev['index'])
+                            self.available_cameras.append(dev['index'])
+                        self.camera_b_display.setText(
+                            f"已在 0-{max(0, scanned - 1)} 找到 {len(found_devices)} 个视频设备，正在继续扩展搜索..."
+                        )
+                        self.open_close_b_btn.setEnabled(True)
+                    else:
+                        self.camera_b_display.setText(
+                            f"基础扫描 0-{max(0, scanned - 1)} 未发现设备，正在继续扩展搜索..."
+                        )
+                        self.open_close_b_btn.setEnabled(False)
+
+                self.run_on_ui(lambda fd=list(devices_by_index.values()), s=primary_max: apply_intermediate(fd, s))
+
+                if len(devices_by_index) < target_count and extended_max > primary_max:
+                    extra_indices = list(range(primary_max, extended_max))
+                    extra_devices = scan_indices(extra_indices, backend=preferred_backend, workers=primary_workers, allow_fallback=False, include_any=False)
+                    for dev in extra_devices:
+                        devices_by_index[int(dev['index'])] = dev
+                    scanned_indices.update(extra_indices)
+                    scanned_max_index = extended_max
+
+                if len(devices_by_index) < target_count and bool(getattr(self.config, 'camera_search_enable_msmf_fallback', True)):
+                    missing_indices = [idx for idx in range(0, scanned_max_index) if idx not in devices_by_index]
+                    extra_devices = scan_indices(missing_indices, backend=fallback_backend, workers=fallback_workers, allow_fallback=False, include_any=False)
+                    for dev in extra_devices:
+                        devices_by_index[int(dev['index'])] = dev
+
+                if len(devices_by_index) == 0 and bool(getattr(self.config, 'camera_search_allow_cap_any_fallback', False)):
+                    any_devices = scan_indices(range(0, scanned_max_index), backend=cv2.CAP_ANY, workers=1, allow_fallback=False, include_any=True)
+                    for dev in any_devices:
+                        devices_by_index[int(dev['index'])] = dev
+
+                devices = sorted(devices_by_index.values(), key=lambda item: item['index'])
+                scan_seconds = time.time() - scan_start
+                self.device_search_cache_b = {'timestamp': time.time(), 'devices': devices}
+
+            self.device_search_force_refresh_b = False
 
             def apply_results():
                 self.camera_b_combo_box.clear()
@@ -649,27 +780,41 @@ class CameraFlowMixin:
                         camera_info = f"Camera {dev['index']} ({dev['width']}x{dev['height']}, {dev['fps']:.2f}fps, {backend_name})"
                         self.camera_b_combo_box.addItem(camera_info, userData=dev['index'])
                         self.available_cameras.append(dev['index'])
-                    self.camera_b_display.setText(f"查找完成，共发现 {len(devices)} 个视频设备")
+                    cache_text = '（来自缓存）' if used_cache else ''
+                    self.camera_b_display.setText(
+                        f"查找完成{cache_text}，共发现 {len(devices)} 个视频设备（扫描 0-{max(0, scanned_max_index - 1)}，耗时 {scan_seconds:.2f}s）"
+                    )
                     self.open_close_b_btn.setEnabled(True)
                 else:
                     self.camera_b_combo_box.addItem("No local camera found", userData=None)
-                    self.camera_b_display.setText("未查到可用视频设备。若设备已插入，请确认驱动正常、未被其他软件占用，并重新点击查找。")
+                    self.camera_b_display.setText(
+                        f"未查到可用视频设备（已扫描 0-{max(0, scanned_max_index - 1)}）。建议点击“设备诊断”查看每个索引在 DSHOW/MSMF 下的打开情况。"
+                    )
                     self.open_close_b_btn.setEnabled(False)
                 self.find_b_btn.setEnabled(True)
+                try:
+                    self.diagnose_b_btn.setEnabled(True)
+                except Exception:
+                    pass
                 self.device_search_busy_b = False
 
             self.run_on_ui(apply_results)
         except Exception as exc:
             print(f'[Camera B] device search failed: {exc}')
+            self.device_search_force_refresh_b = False
             def apply_failure(msg=str(exc)):
                 self.camera_b_combo_box.clear()
                 self.camera_b_combo_box.addItem('No local camera found', userData=None)
                 self.camera_b_display.setText(f'普通相机搜索失败: {msg}')
                 self.find_b_btn.setEnabled(True)
+                try:
+                    self.diagnose_b_btn.setEnabled(True)
+                except Exception:
+                    pass
                 self.open_close_b_btn.setEnabled(False)
                 self.device_search_busy_b = False
-            self.run_on_ui(apply_failure)
 
+            self.run_on_ui(apply_failure)
 
     def save_result_b(self):
         notice_mes = '保存'

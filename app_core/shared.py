@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-APP_VERSION = "P6.5-logic-audit-hotfix5"
+APP_VERSION = "P6.7-performance-ui-hotfix11"
 
 
 class MainThreadExecutor(QObject):
@@ -75,8 +75,15 @@ class SystemConfig:
     realtime_measure_every_n: int = 1
     realtime_measure_long_side: int = 512
     ui_fast_scaling: bool = True
-    camera_search_max_index: int = 6
-    camera_search_cache_ttl_s: float = 3.0
+    camera_search_max_index: int = 5
+    camera_search_extended_max_index: int = 12
+    camera_search_target_count: int = 2
+    camera_search_probe_reads: int = 1
+    camera_search_probe_delay_ms: int = 2
+    camera_search_disable_cap_any_probe: bool = True
+    camera_search_max_workers: int = 8
+    camera_search_cache_ttl_s: float = 1.0
+    camera_search_report_partial_results: bool = True
     max_preview_fps: int = 20
     mv_display_interval_ms: int = 15
     mv_preview_long_side: int = 1440
@@ -147,6 +154,25 @@ class SystemConfig:
     ui_preview_fill_camera_a: bool = True
     ui_preview_fill_camera_b: bool = False
     ui_preview_allow_upscale: bool = True
+    ui_show_event_log: bool = True
+    ui_workspace_mode: str = 'overview'
+    ui_show_quick_mode_bar: bool = True
+    ui_status_update_min_interval_ms: int = 120
+    ui_zoom_live_fps: int = 12
+    output_dir: str = 'data'
+    app_display_name: str = 'Crack Detecttion - EatRice Studio'
+    enable_camera_a_module: bool = False
+    enable_camera_b_module: bool = True
+    startup_choose_camera_mode: bool = True
+    ui_restore_window_geometry: bool = True
+    ui_window_width: int = 0
+    ui_window_height: int = 0
+    ui_window_x: int = -1
+    ui_window_y: int = -1
+    ui_root_splitter_sizes: list[int] = field(default_factory=list)
+    ui_center_splitter_sizes: list[int] = field(default_factory=list)
+    ui_preview_mode_camera_a: str = 'fill'
+    ui_preview_mode_camera_b: str = 'fit'
 
 
 @dataclass
