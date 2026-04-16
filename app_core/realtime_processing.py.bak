@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
 import threading
 import time
 from collections import deque
@@ -168,14 +167,6 @@ class RealtimeProcessingMixin:
 
 
     def update_fps_status_label(self):
-        if bool(getattr(self, '_app_closing', False)):
-            return
-        if threading.current_thread() is not threading.main_thread():
-            try:
-                self.run_on_ui(self.update_fps_status_label)
-            except Exception:
-                pass
-            return
         self.current_preview_fps = self._compute_fps(self.preview_fps_timestamps)
         self.current_display_fps = self._compute_fps(self.display_fps_timestamps)
         self.current_inference_fps = self._compute_fps(self.inference_fps_timestamps)
@@ -330,11 +321,7 @@ class RealtimeProcessingMixin:
                 return
         picture_name = time.strftime('patrol_%Y%m%d_%H%M%S.jpg')
         result_image = detection_result.output_image if detection_result.output_image is not None else frame
-        try:
-            self.save_detection_artifacts(frame, picture_name, result_image, detection_result, 'patrol_auto')
-        except Exception as exc:
-            self.latest_realtime_message = f'巡检模式自动保存失败: {exc}'
-            return
+        self.save_detection_artifacts(frame, picture_name, result_image, detection_result, 'patrol_auto')
         self.patrol_signatures.append(signature)
         self.last_patrol_capture_ts = now_ts
         self.latest_realtime_message = f'巡检模式: 已自动拍摄 {picture_name}'
@@ -533,15 +520,10 @@ class RealtimeProcessingMixin:
 
 
     def run_on_ui(self, callback):
-        if callback is None or bool(getattr(self, '_app_closing', False)):
-            return
-        executor = getattr(self, 'ui_executor', None)
-        if executor is None:
+        if callback is None:
             return
         try:
-            executor.call.emit(callback)
-        except RuntimeError:
-            pass
+            self.ui_executor.call.emit(callback)
         except Exception as exc:
             print(f'[UI callback emit] failed: {exc}')
 

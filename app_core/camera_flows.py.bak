@@ -13,8 +13,6 @@ import numpy as np
 import torch
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QMessageBox
-from skimage.filters import threshold_otsu
-from skimage.morphology import skeletonize
 
 from app_core.shared import DetectionResult
 
@@ -60,7 +58,6 @@ class CameraFlowMixin:
                         message += "\n" + " | ".join(parts)
                 self.camera_a_display.setText('')
                 self.update_model_status_label(message + f"\n工业相机A预览配置：Exposure={self.config.mv_preview_exposure_us:.0f}us | AutoExposure={'On' if self.config.mv_preview_auto_exposure else 'Off'} | PixelFormat={'Mono8' if self.config.mv_preview_force_mono8 else '原始'} | TargetFPS={self.config.mv_preview_target_fps if self.config.mv_preview_target_fps > 0 else 'max'}")
-                self._camera_a_preview_recover_last_ts = 0.0
                 self.is_running_a = True
                 if self.video_thread_a and self.video_thread_a.is_alive():
                     self.video_thread_a.join(timeout=0.5)
@@ -113,16 +110,8 @@ class CameraFlowMixin:
                     time.sleep(0.002)
                 else:
                     empty_count += 1
-                    if empty_count in (50, int(getattr(self.config, 'camera_a_empty_recover_threshold', 150) or 150)):
-                        try:
-                            mv_stats = self.cameraA.get_preview_stats() if getattr(self, 'cameraA', None) is not None else {}
-                        except Exception:
-                            mv_stats = {}
-                        pixel_name = mv_stats.get('pixel_type_name', '') or 'Unknown'
-                        grab_fps = float(mv_stats.get('grab_fps', 0.0) or 0.0)
-                        display_fps = float(mv_stats.get('display_fps', 0.0) or 0.0)
-                        last_error = mv_stats.get('last_error', '') or getattr(self.cameraA, 'last_error', '') or ''
-                        print(f'[Camera A] preview frame is still empty; grab_fps={grab_fps:.1f}, display_fps={display_fps:.1f}, pixel={pixel_name}, last_error={last_error}')
+                    if empty_count in (50, 150):
+                        print('[Camera A] preview frame is still empty; check MVS display mode / exposure / trigger settings.')
                         if empty_count == 50 and bool(getattr(self.config, 'mv_preview_force_mono8', False)) and bool(getattr(self.config, 'mv_preview_auto_recover_pixel_format', True)):
                             try:
                                 self.cameraA.configure_preview_profile(force_mono8=False)
@@ -132,19 +121,6 @@ class CameraFlowMixin:
                                 self.update_model_status_label('工业相机A预览为空，已自动关闭 Mono8 预览并恢复原始 PixelFormat。')
                             except Exception as exc:
                                 print(f'[Camera A] auto recover pixel format failed: {exc}')
-                        recover_threshold = int(getattr(self.config, 'camera_a_empty_recover_threshold', 150) or 150)
-                        if empty_count >= recover_threshold and bool(getattr(self.config, 'camera_a_auto_recover_preview', True)):
-                            now_ts = time.time()
-                            cooldown = max(1.0, float(getattr(self.config, 'camera_a_preview_recover_cooldown_s', 5.0) or 5.0))
-                            if (now_ts - float(getattr(self, '_camera_a_preview_recover_last_ts', 0.0) or 0.0)) >= cooldown:
-                                self._camera_a_preview_recover_last_ts = now_ts
-                                try:
-                                    ok, info = self.cameraA.recover_preview_stream()
-                                    print(f'[Camera A] preview auto-recover: ok={ok} info={info}')
-                                    if ok:
-                                        self.update_model_status_label('工业相机A预览空帧，已自动重启取流。')
-                                except Exception as exc:
-                                    print(f'[Camera A] preview auto-recover failed: {exc}')
                     time.sleep(0.01)
             except Exception as exc:
                 print(f'[Camera A] video loop error: {exc}')
@@ -170,9 +146,6 @@ class CameraFlowMixin:
             QMessageBox.warning(self, "错误", "当前已有图像正在处理中，请稍后尝试！")
             return
         try:
-            if bool(getattr(self.config, 'camera_b_pause_during_camera_a_capture', True)):
-                self._set_camera_b_capture_guard(True)
-                self._pause_camera_b_temporarily(reason='camera_a_capture_start')
             self.deal_picture_flag = 1
             capture_timeout = max(1.0, float(getattr(self.config, 'camera_a_capture_timeout_s', 3.0)))
             prev_seq = None
@@ -185,14 +158,12 @@ class CameraFlowMixin:
                         prev_seq = None
                     break
             temp_picture = os.path.join(self.base_dir, 'temp.jpg')
-            temp_picture_candidates = [temp_picture, os.path.abspath('./temp.jpg')]
             if bool(getattr(self.config, 'camera_a_capture_remove_stale_temp', True)):
-                for _tmp_path in temp_picture_candidates:
-                    try:
-                        if _tmp_path and os.path.exists(_tmp_path):
-                            os.remove(_tmp_path)
-                    except Exception:
-                        pass
+                try:
+                    if os.path.exists(temp_picture):
+                        os.remove(temp_picture)
+                except Exception:
+                    pass
             self.cameraA.trigger_once(1)
             frame = None
             deadline = time.time() + capture_timeout
@@ -221,13 +192,10 @@ class CameraFlowMixin:
                 if frame is not None and getattr(frame, 'size', 0) > 0:
                     break
                 time.sleep(0.02)
-            if frame is None or getattr(frame, 'size', 0) == 0:
-                for _tmp_path in temp_picture_candidates:
-                    if self.wait_for_file_ready(_tmp_path, timeout=min(2.5, capture_timeout)):
-                        pixmap = QPixmap(_tmp_path)
-                        if not pixmap.isNull():
-                            frame = self.pixmap_to_bgr(pixmap)
-                            break
+            if (frame is None or getattr(frame, 'size', 0) == 0) and self.wait_for_file_ready(temp_picture, timeout=min(2.5, capture_timeout)):
+                pixmap = QPixmap(temp_picture)
+                if not pixmap.isNull():
+                    frame = self.pixmap_to_bgr(pixmap)
             if frame is None or getattr(frame, 'size', 0) == 0:
                 if bool(getattr(self.config, 'camera_a_allow_preview_fallback', False)):
                     frame = self.cameraA.get_latest_preview_frame()
@@ -245,9 +213,6 @@ class CameraFlowMixin:
             QMessageBox.critical(self, '错误', f'摄像头A抓拍失败: {exc}')
             self.save_a_btn.setEnabled(False)
         finally:
-            if bool(getattr(self.config, 'camera_b_pause_during_camera_a_capture', True)):
-                self._set_camera_b_capture_guard(False)
-                self._pause_camera_b_temporarily(reason='camera_a_capture_finish')
             self.deal_picture_flag = 0
 
 
@@ -294,25 +259,22 @@ class CameraFlowMixin:
         camera_a_result = getattr(self, 'final_result_a', None) or self.final_result
         camera_a_detection = getattr(self, 'last_detection_result_a', None) or self.last_detection_result
         if self.frame_a_capture is not None and self.picturename_a is not None and camera_a_result is not None:
-            try:
-                org_filename, out_filename = self.save_detection_artifacts(
-                    self.frame_a_capture,
-                    self.picturename_a,
-                    camera_a_result,
-                    camera_a_detection,
-                    'camera_a'
-                )
-                self.logger.log({
-                    "时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "原始图片名": org_filename,
-                    "结果图片名": out_filename,
-                    "圆心位置": self.camera_a_position.text(),
-                    "裂缝宽度": self.camera_a_width.text(),
-                    "实际距离": self.camera_a_distance.text()
-                })
-                notice_mes += '成功'
-            except Exception as exc:
-                notice_mes += f'失败\n{exc}'
+            org_filename, out_filename = self.save_detection_artifacts(
+                self.frame_a_capture,
+                self.picturename_a,
+                camera_a_result,
+                camera_a_detection,
+                'camera_a'
+            )
+            self.logger.log({
+                "时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "原始图片名": org_filename,
+                "结果图片名": out_filename,
+                "圆心位置": self.camera_a_position.text(),
+                "裂缝宽度": self.camera_a_width.text(),
+                "实际距离": self.camera_a_distance.text()
+            })
+            notice_mes += '成功'
         else:
             notice_mes += '失败'
         QMessageBox.information(self, "通知", notice_mes)
@@ -323,63 +285,47 @@ class CameraFlowMixin:
             current_index = self.camera_b_combo_box.currentData()
             if current_index is None:
                 current_index = self.camera_b_combo_box.currentText().strip()
-            cap, backend = self.open_video_capture(current_index)
-            with self.camera_b_lock:
-                self.camera_b = cap
-                self.current_camera_b_backend = backend
-                self.camera_b_open_backend = backend
-            if cap is None or not cap.isOpened():
-                try:
-                    if cap is not None:
-                        cap.release()
-                except Exception:
-                    pass
+            self.camera_b, self.current_camera_b_backend = self.open_video_capture(current_index)
+            if self.camera_b is None or not self.camera_b.isOpened():
                 QMessageBox.critical(self, "打开失败", f"无法打开摄像头 {current_index}。可尝试关闭MVS、相机助手或其它占用相机的软件后重试。")
-                with self.camera_b_lock:
-                    self.camera_b = None
-                    self.current_camera_b_backend = None
-                self.is_running_b = False
-                self._next_camera_b_session_id()
-                self.capture_b_btn.setEnabled(False)
-                self.save_b_btn.setEnabled(False)
+                self.camera_b = None
+                self.current_camera_b_backend = None
             else:
                 self.current_device_index = current_index
-                self._configure_camera_b_capture(cap, backend)
+                try:
+                    max_fps = int(getattr(self.config, 'max_preview_fps', 0) or 0)
+                    if max_fps > 0:
+                        self.camera_b.set(cv2.CAP_PROP_FPS, float(max_fps))
+                except Exception:
+                    pass
                 self.open_close_b_btn.setText("⏹️ 关闭设备")
                 self.find_b_btn.setEnabled(False)
                 self.capture_b_btn.setEnabled(True)
                 self.camera_b_connection.setEnabled(False)
                 self.camera_b_combo_box.setEnabled(False)
                 self.camera_b_input.setEnabled(False)
+                try:
+                    self.camera_b.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
                 self.camera_b_last_frame_ts = time.time()
-                self.camera_b_pause_until = 0.0
-                self.camera_b_resume_guard_until = 0.0
                 self.camera_b_read_failures = 0
-                self._camera_b_capture_guard_depth = 0
                 self._camera_b_reconnect_pending = False
                 self._camera_b_reconnect_attempts = 0
                 self.camera_b_display.setText(f"相机B已开启 ({self.backend_name(self.current_camera_b_backend)})")
                 self.is_running_b = True
-                session_id = self._next_camera_b_session_id()
-                self.video_thread_b = threading.Thread(target=self.video_loop_b, args=(session_id,), daemon=True)
+                self.video_thread_b = threading.Thread(target=self.video_loop_b, daemon=True)
                 self.video_thread_b.start()
         else:
             self.is_running_b = False
-            self._next_camera_b_session_id()
-            if self.video_thread_b and self.video_thread_b is not threading.current_thread():
+            if self.video_thread_b:
                 self.video_thread_b.join(timeout=1.0)
-            self.video_thread_b = None
-            with self.camera_b_lock:
-                if self.camera_b:
-                    self.camera_b.release()
-                    self.camera_b = None
-                self.current_camera_b_backend = None
-                self.camera_b_open_backend = None
+            if self.camera_b:
+                self.camera_b.release()
+                self.camera_b = None
+            self.current_camera_b_backend = None
             self.camera_b_last_frame_ts = 0.0
-            self.camera_b_pause_until = 0.0
-            self.camera_b_resume_guard_until = 0.0
             self.camera_b_read_failures = 0
-            self._camera_b_capture_guard_depth = 0
             self._camera_b_reconnect_pending = False
             self._camera_b_reconnect_attempts = 0
             self.preview_fps_timestamps.clear()
@@ -401,42 +347,20 @@ class CameraFlowMixin:
             self.latest_live_signature = ''
 
 
-    def video_loop_b(self, session_id=None):
+    def video_loop_b(self):
         consecutive_failures = 0
         stall_timeout_s = max(2.0, float(getattr(self.config, 'camera_b_stall_timeout_s', 6.0)))
         fail_threshold = max(10, int(getattr(self.config, 'camera_b_read_fail_threshold', 120)))
-        retry_burst = max(0, int(getattr(self.config, 'camera_b_read_retry_burst', 2) or 0))
-        retry_delay_s = max(0.0, float(getattr(self.config, 'camera_b_retry_read_delay_ms', 6) or 0.0) / 1000.0)
-        active_session = int(session_id if session_id is not None else getattr(self, 'camera_b_session_id', 0) or 0)
-        while self.is_running_b:
-            if active_session != int(getattr(self, 'camera_b_session_id', 0) or 0):
-                break
+        while self.is_running_b and self.camera_b is not None and self.camera_b.isOpened():
             loop_start = time.perf_counter()
-            if self._camera_b_is_paused():
-                consecutive_failures = 0
-                self.camera_b_read_failures = 0
-                time.sleep(0.01)
-                continue
             try:
-                with self.camera_b_lock:
-                    cap = self.camera_b
-                    if cap is None or not cap.isOpened():
-                        break
-                    ret, frame = cap.read()
-                    if (not ret or frame is None or getattr(frame, 'size', 0) == 0) and retry_burst > 0:
-                        for _ in range(retry_burst):
-                            if retry_delay_s > 0:
-                                time.sleep(retry_delay_s)
-                            ret, frame = cap.read()
-                            if ret and frame is not None and getattr(frame, 'size', 0) > 0:
-                                break
-                safe_frame = self._sanitize_camera_b_frame(frame) if ret else None
-                if safe_frame is not None:
+                ret, frame = self.camera_b.read()
+                if ret and frame is not None and frame.size > 0:
                     consecutive_failures = 0
                     self.camera_b_read_failures = 0
                     self.camera_b_last_frame_ts = time.time()
                     self._push_fps_timestamp(self.preview_fps_timestamps)
-                    raw_frame = self.normalize_frame_orientation(safe_frame)
+                    raw_frame = self.normalize_frame_orientation(np.ascontiguousarray(frame))
                     self.frame_b = raw_frame.copy()
                     use_preview_stab = bool(getattr(self.config, 'anti_shake_enabled', False) and getattr(self.config, 'anti_shake_preview_enabled', False))
                     preview_frame = self.apply_preview_stabilization(raw_frame) if use_preview_stab else raw_frame
@@ -494,32 +418,20 @@ class CameraFlowMixin:
                         self.last_camera_b_display_ts = now
                         self.queue_view_frame('camera_b', preview_frame)
                 else:
-                    if time.time() < float(getattr(self, 'camera_b_resume_guard_until', 0.0) or 0.0):
-                        time.sleep(0.01)
-                        continue
                     consecutive_failures += 1
                     self.camera_b_read_failures = consecutive_failures
                     if consecutive_failures in (10, 30) or consecutive_failures % 60 == 0:
                         print(f'[Camera B] read failed x{consecutive_failures} on backend {self.backend_name(self.current_camera_b_backend)}')
-                    if active_session != int(getattr(self, 'camera_b_session_id', 0) or 0):
-                        break
                     if consecutive_failures >= fail_threshold or ((time.time() - float(getattr(self, 'camera_b_last_frame_ts', 0.0) or 0.0)) >= stall_timeout_s and consecutive_failures >= 10):
-                        if not self._camera_b_is_paused():
-                            self._schedule_camera_b_reconnect(f'read failed x{consecutive_failures}')
+                        self._schedule_camera_b_reconnect(f'read failed x{consecutive_failures}')
                         break
                     time.sleep(0.01)
             except Exception as exc:
-                if time.time() < float(getattr(self, 'camera_b_resume_guard_until', 0.0) or 0.0):
-                    time.sleep(0.01)
-                    continue
                 consecutive_failures += 1
                 self.camera_b_read_failures = consecutive_failures
                 print(f'[Camera B] video loop error: {exc}')
-                if active_session != int(getattr(self, 'camera_b_session_id', 0) or 0):
-                    break
                 if consecutive_failures >= fail_threshold:
-                    if not self._camera_b_is_paused():
-                        self._schedule_camera_b_reconnect(f'video loop error: {exc}')
+                    self._schedule_camera_b_reconnect(f'video loop error: {exc}')
                     break
                 time.sleep(0.02)
             max_fps = int(getattr(self.config, 'max_preview_fps', 0) or 0)
@@ -933,25 +845,22 @@ class CameraFlowMixin:
         camera_b_result = getattr(self, 'final_result_b', None) or self.final_result
         camera_b_detection = getattr(self, 'last_detection_result_b', None) or self.last_detection_result
         if self.frame_b_capture is not None and self.picturename_b is not None and camera_b_result is not None:
-            try:
-                org_filename, out_filename = self.save_detection_artifacts(
-                    self.frame_b_capture,
-                    self.picturename_b,
-                    camera_b_result,
-                    camera_b_detection,
-                    'camera_b'
-                )
-                self.logger.log({
-                    "时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "原始图片名": org_filename,
-                    "结果图片名": out_filename,
-                    "圆心位置": self.camera_b_position.text(),
-                    "裂缝宽度": self.camera_b_width.text(),
-                    "实际距离": self.camera_b_distance.text()
-                })
-                notice_mes += '成功'
-            except Exception as exc:
-                notice_mes += f'失败\n{exc}'
+            org_filename, out_filename = self.save_detection_artifacts(
+                self.frame_b_capture,
+                self.picturename_b,
+                camera_b_result,
+                camera_b_detection,
+                'camera_b'
+            )
+            self.logger.log({
+                "时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "原始图片名": org_filename,
+                "结果图片名": out_filename,
+                "圆心位置": self.camera_b_position.text(),
+                "裂缝宽度": self.camera_b_width.text(),
+                "实际距离": self.camera_b_distance.text()
+            })
+            notice_mes += '成功'
         else:
             notice_mes += '失败'
         QMessageBox.information(self, "通知", notice_mes)

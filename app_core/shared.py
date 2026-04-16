@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-APP_VERSION = "P6.7-performance-ui-hotfix11"
+APP_VERSION = "P6.8-stability-iteration1"
 
 
 class MainThreadExecutor(QObject):
@@ -136,7 +136,23 @@ class SystemConfig:
     realtime_idle_clear_transform: bool = True
     realtime_pt_confidence: float = 0.10
     realtime_frame_queue_mode: str = 'latest'
-    queue_copy_frames: bool = False
+    queue_copy_frames: bool = True
+    camera_b_auto_reconnect: bool = True
+    camera_b_read_fail_threshold: int = 120
+    camera_b_stall_timeout_s: float = 6.0
+    camera_b_reconnect_retry_delay_ms: int = 1200
+    camera_b_reconnect_max_attempts: int = 3
+    camera_b_reconnect_keep_backend: bool = True
+    camera_b_reconnect_allow_cross_backend: bool = False
+    camera_b_runtime_allow_cap_any: bool = False
+    camera_b_read_retry_burst: int = 2
+    camera_b_retry_read_delay_ms: int = 6
+    camera_b_pause_during_camera_a_capture: bool = True
+    camera_b_pause_after_camera_a_capture_ms: int = 900
+    camera_b_stabilize_after_pause_ms: int = 600
+    camera_b_runtime_preferred_backend: str = 'DSHOW'
+    camera_b_open_allow_cross_backend: bool = False
+    camera_b_preferred_fourcc: str = 'AUTO'
 
     # 普通相机 B 的细裂缝专用模型配置
     camera_b_use_dedicated_model: bool = True
@@ -148,6 +164,9 @@ class SystemConfig:
     camera_b_allow_preview_pt_fallback: bool = True
     mv_preview_auto_recover_pixel_format: bool = True
     camera_a_capture_remove_stale_temp: bool = True
+    camera_a_auto_recover_preview: bool = True
+    camera_a_empty_recover_threshold: int = 150
+    camera_a_preview_recover_cooldown_s: float = 5.0
     ui_control_panel_mode: str = 'compact'
     ui_control_panel_hidden: bool = False
     ui_show_model_config_on_startup: bool = True

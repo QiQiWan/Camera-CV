@@ -1,0 +1,36 @@
+Windows fatal exception: access violation
+
+Thread 0x000031f8 (most recent call first):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\app_core\camera_flows.py", line 357 in video_loop_b
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1012 in run
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00008094 (most recent call first):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\app_core\camera_flows.py", line 136 in _ensure_bgr_frame
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\app_core\camera_flows.py", line 102 in video_loop_a
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1012 in run
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x0000afd4 (most recent call first):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\driver\MvCameraControl_class.py", line 369 in MV_CC_GetImageBuffer
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\driver\CamOperation_class.py", line 299 in Work_thread
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1012 in run
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1032 in _bootstrap
+
+Current thread 0x00002250 (most recent call first):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 1615 in _apply_status_card_state
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 1627 in _set_status_card
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142 in refresh_runtime_strip
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\app_core\model_runtime.py", line 1348 in save_detection_artifacts
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\app_core\realtime_processing.py", line 324 in maybe_patrol_capture
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\app_core\realtime_processing.py", line 480 in realtime_detection_worker
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\app_core\realtime_processing.py", line 559 in realtime_worker_loop
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1012 in run
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1075 in _bootstrap_inner
+  File "C:\Users\EatRice\.conda\envs\crack\Lib\threading.py", line 1032 in _bootstrap
+
+Thread 0x00008500 (most recent call first):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3593 in <module>

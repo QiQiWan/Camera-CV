@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -19,25 +18,6 @@ from ultralytics import YOLO
 
 from app_core.shared import APP_VERSION, DetectionResult
 from app_core.thincrack_unet import ThinCrackUNet
-
-
-def _json_safe_value(value):
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe_value(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _json_safe_value(v) for k, v in value.items()}
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    try:
-        return float(value)
-    except Exception:
-        return str(value)
 
 
 class ModelRuntimeMixin:
@@ -352,16 +332,11 @@ class ModelRuntimeMixin:
 
 
     def _apply_model_status_text(self, message=''):
-        if bool(getattr(self, '_app_closing', False)):
-            return
         summary = self._build_model_status_summary(message)
         if summary == getattr(self, '_last_model_status_rendered', ''):
             return
         self._last_model_status_rendered = summary
-        try:
-            self.model_status_label.setText(summary)
-        except RuntimeError:
-            return
+        self.model_status_label.setText(summary)
         try:
             if message and hasattr(self, 'append_runtime_event'):
                 lower_msg = str(message).lower()
@@ -391,15 +366,6 @@ class ModelRuntimeMixin:
 
 
     def update_model_status_label(self, message=''):
-        if bool(getattr(self, '_app_closing', False)):
-            return
-        if threading.current_thread() is not threading.main_thread():
-            queued_message = str(message or '')
-            try:
-                self.run_on_ui(lambda msg=queued_message: self.update_model_status_label(msg))
-            except Exception:
-                pass
-            return
         message = str(message or '')
         is_realtime_message = message.startswith('实时检测:')
         min_interval_ms = max(40, int(getattr(self.config, 'ui_status_update_min_interval_ms', 120) or 120))
@@ -1335,25 +1301,10 @@ class ModelRuntimeMixin:
 
 
     def save_detection_artifacts(self, frame, picture_name, result_image, detection_result, source_label):
-        save_dir = str(getattr(self, 'filepath', '') or '')
-        if not save_dir:
-            raise RuntimeError('结果保存目录为空，无法保存检测结果。')
-        os.makedirs(save_dir, exist_ok=True)
-        org_filename = os.path.join(save_dir, picture_name)
-        out_filename = os.path.join(save_dir, 'result_' + picture_name)
-        frame_to_save = frame if frame is not None else result_image
-        result_to_save = result_image if result_image is not None else frame_to_save
-        if frame_to_save is None or result_to_save is None:
-            raise RuntimeError('当前没有可保存的图像数据。')
-        ok_org = bool(cv2.imwrite(org_filename, frame_to_save))
-        ok_out = bool(cv2.imwrite(out_filename, result_to_save))
-        if not ok_org or not ok_out:
-            failed = []
-            if not ok_org:
-                failed.append(org_filename)
-            if not ok_out:
-                failed.append(out_filename)
-            raise RuntimeError('图像写入失败: ' + ' | '.join(failed))
+        org_filename = os.path.join(self.filepath, picture_name)
+        out_filename = os.path.join(self.filepath, 'result_' + picture_name)
+        cv2.imwrite(org_filename, frame)
+        cv2.imwrite(out_filename, result_image)
         if self.config.save_metadata_json and detection_result is not None:
             seg_model_path = self.onnx_model_path if self.seg_backend_type == 'onnx' else self.yolo_model_path if self.seg_backend_type == 'pt' else ''
             metadata = {
@@ -1362,31 +1313,28 @@ class ModelRuntimeMixin:
                 'source': source_label,
                 'original_image': org_filename,
                 'result_image': out_filename,
-                'center': _json_safe_value(detection_result.center),
+                'center': detection_result.center,
                 'width_px': round(float(detection_result.width_px), 4),
                 'actual_distance_mm': None if detection_result.actual_distance_mm is None else round(float(detection_result.actual_distance_mm), 4),
                 'inference_ms': round(float(detection_result.inference_ms), 3),
                 'postprocess_ms': round(float(detection_result.postprocess_ms), 3),
-                'mm_per_pixel': _json_safe_value(self.mm_per_pixel),
-                'estimated_mm_per_pixel': _json_safe_value(self.latest_estimated_mm_per_pixel),
+                'mm_per_pixel': self.mm_per_pixel,
+                'estimated_mm_per_pixel': self.latest_estimated_mm_per_pixel,
                 'measurement_source': getattr(detection_result, 'measurement_source', self.current_measurement_source),
-                'laser_distance_mm': _json_safe_value(self.last_laser_distance_mm),
+                'laser_distance_mm': self.last_laser_distance_mm,
                 'inference_mode': getattr(detection_result, 'inference_mode', ''),
-                'tile_rows': int(getattr(detection_result, 'tile_rows', 0) or 0),
-                'tile_cols': int(getattr(detection_result, 'tile_cols', 0) or 0),
-                'tile_count': int(getattr(detection_result, 'tile_count', 0) or 0),
-                'tile_total_ms': float(getattr(detection_result, 'tile_total_ms', 0.0) or 0.0),
-                'tile_avg_ms': float(getattr(detection_result, 'tile_avg_ms', 0.0) or 0.0),
-                'line_start': _json_safe_value(getattr(detection_result, 'line_start', None)),
-                'line_end': _json_safe_value(getattr(detection_result, 'line_end', None)),
-                'measurement_method': getattr(detection_result, 'measurement_method', ''),
+                'tile_rows': getattr(detection_result, 'tile_rows', 0),
+                'tile_cols': getattr(detection_result, 'tile_cols', 0),
+                'tile_count': getattr(detection_result, 'tile_count', 0),
+                'tile_total_ms': getattr(detection_result, 'tile_total_ms', 0.0),
+                'tile_avg_ms': getattr(detection_result, 'tile_avg_ms', 0.0),
                 'active_scene_profile': self.config.active_scene_profile,
-                'config': _json_safe_value(asdict(self.config)),
+                'config': asdict(self.config),
                 'note': detection_result.note,
                 'seg_model_path': seg_model_path,
                 'preview_model_path': self.yolo_model_path,
             }
-            meta_filename = os.path.join(save_dir, f'{Path(picture_name).stem}_meta.json')
+            meta_filename = os.path.join(self.filepath, f'{Path(picture_name).stem}_meta.json')
             with open(meta_filename, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)
         try:

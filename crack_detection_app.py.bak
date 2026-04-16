@@ -16,9 +16,6 @@ from pathlib import Path
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
-from scipy.ndimage import distance_transform_edt
-from skimage.filters import threshold_otsu
-from skimage.morphology import skeletonize
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QGroupBox, QDialog, QFileDialog, QMenu,
                                QLabel, QPushButton, QComboBox, QMessageBox, QRadioButton, QLineEdit, QSlider, QSpinBox, QInputDialog, QCheckBox,
                                QScrollArea, QSplitter, QSizePolicy, QTabWidget, QStackedWidget, QDialogButtonBox, QFrame, QLayout,
@@ -509,12 +506,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.device_search_force_refresh_b = False
         self.camera_probe_backend_cache = {}
         self.current_camera_b_backend = None
-        self.camera_b_open_backend = None
-        self.camera_b_pause_until = 0.0
-        self.camera_b_resume_guard_until = 0.0
-        self.camera_b_session_id = 0
-        self._camera_b_capture_guard_depth = 0
-        self._camera_a_preview_recover_last_ts = 0.0
         self.deal_picture_flag = False
         self.processing_lock = threading.Lock()
         self.preview_frame_count = 0
@@ -523,7 +514,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.last_source_label = ''
         self.video_thread_b = None
         self.camera_b = None
-        self.camera_b_lock = threading.RLock()
         self.semantic_result_cb = None
         self.picturename_b = None
         self.frame_b_capture = None
@@ -578,7 +568,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.realtime_worker_stop = False
         self.realtime_worker_event = threading.Event()
         self.realtime_worker_thread = None
-        self._app_closing = False
         self.realtime_measure_counter = 0
         self.last_realtime_measurement = None
         self.last_realtime_measure_ts = 0.0
@@ -1022,10 +1011,9 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.center_splitter = center_splitter
         self.model_config_content = self.build_model_config_content(panel_style)
         self.config_summary_label = QLabel('模型配置：准备中')
-        self.config_summary_label.setWordWrap(False)
+        self.config_summary_label.setWordWrap(True)
         self.config_summary_label.setMinimumHeight(40 if small_screen else 46)
-        self.config_summary_label.setMaximumHeight(56 if small_screen else 60)
-        self.config_summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.config_summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.config_summary_label.setStyleSheet('padding:8px 10px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
         self.runtime_strip_label = QLabel('运行摘要：准备中')
         self.runtime_strip_label.hide()
@@ -1592,9 +1580,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
     def _create_status_card(self, title, accent='#2563eb'):
         frame = QFrame()
         frame.setObjectName('statusCard')
-        frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        frame.setMinimumHeight(86)
-        frame.setMaximumHeight(86)
         frame.setStyleSheet(
             f"QFrame#statusCard {{background:#ffffff; border:1px solid #dfe7ef; border-left:4px solid {accent}; border-radius:10px;}}"
             " QLabel[role='title'] {color:#64748b; font-size:12px; font-weight:600;}"
@@ -1608,10 +1593,10 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         title_label.setProperty('role', 'title')
         value_label = QLabel('准备中')
         value_label.setProperty('role', 'value')
-        value_label.setWordWrap(False)
+        value_label.setWordWrap(True)
         subtitle_label = QLabel('')
         subtitle_label.setProperty('role', 'subtitle')
-        subtitle_label.setWordWrap(False)
+        subtitle_label.setWordWrap(True)
         layout.addWidget(title_label)
         layout.addWidget(value_label)
         layout.addWidget(subtitle_label)
@@ -1634,21 +1619,12 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             f" QLabel[role='subtitle'] {{color:{subtitle_color}; font-size:12px;}}"
         )
     def _set_status_card(self, card, value, subtitle='', state='info'):
-        if not card or bool(getattr(self, '_app_closing', False)):
+        if not card:
             return
-        try:
-            full_value = self._normalize_status_text(value, max_chars=160)
-            full_subtitle = self._normalize_status_text(subtitle, max_chars=240)
-            self._set_elided_label_text(card.get('value'), full_value)
-            self._set_elided_label_text(card.get('subtitle'), full_subtitle)
-            card['subtitle'].setVisible(bool(full_subtitle))
-            tooltip_parts = [part for part in [full_value, full_subtitle] if part]
-            card['frame'].setToolTip('\n'.join(tooltip_parts))
-            self._apply_status_card_state(card, state)
-        except RuntimeError:
-            pass
-        except Exception:
-            pass
+        card['value'].setText(str(value or ''))
+        card['subtitle'].setText(str(subtitle or ''))
+        card['subtitle'].setVisible(bool(subtitle))
+        self._apply_status_card_state(card, state)
     def _make_status_card_clickable(self, card, tooltip, callback):
         if not card or not card.get('frame'):
             return
@@ -1711,14 +1687,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self._make_status_card_clickable(self.status_camera_a_card, '点击定位到工业相机 A 控制区', lambda: self._focus_control_group('工业相机A'))
         self._make_status_card_clickable(self.status_camera_b_card, '点击定位到普通相机 B 控制区', lambda: self._focus_control_group('普通相机B'))
     def append_runtime_event(self, message, level='info'):
-        if bool(getattr(self, '_app_closing', False)):
-            return
-        if threading.current_thread() is not threading.main_thread():
-            try:
-                self.run_on_ui(lambda msg=str(message or ''), lvl=str(level or 'info'): self.append_runtime_event(msg, lvl))
-            except Exception:
-                pass
-            return
         message = str(message or '').strip()
         if not message:
             return
@@ -1937,16 +1905,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             self.status_cards_layout.addWidget(card['frame'], row, col)
         for col in range(desired_cols):
             self.status_cards_layout.setColumnStretch(col, 1)
-        visible_cards = [card for card in cards if card and card['frame'].isVisible()]
-        rows = max(1, (len(visible_cards) + desired_cols - 1) // desired_cols)
-        card_h = 86
-        spacing = max(0, int(self.status_cards_layout.spacing()))
-        container_h = rows * card_h + max(0, rows - 1) * spacing
-        try:
-            self.status_cards_container.setMinimumHeight(container_h)
-            self.status_cards_container.setMaximumHeight(container_h)
-        except Exception:
-            pass
         self.status_cards_columns = desired_cols
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1969,8 +1927,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         camera_mode_text = '双相机' if bool(getattr(self.config, 'enable_camera_a_module', False)) else '普通相机'
         summary = f'当前主检测模型：{seg_name} | 预览模型：{preview_name} | 实时检测：{realtime_text} | 工作区：{workspace_text} | 设备面板：{mode_text} | 界面模式：{camera_mode_text} | 保存目录：{save_name}'
         if self.config_summary_label is not None:
-            display_summary = self._normalize_status_text(summary, max_chars=220)
-            self._set_elided_label_text(self.config_summary_label, display_summary, tooltip_text=summary)
+            self.config_summary_label.setText(summary)
     def _resolve_output_dir_value(self, output_dir):
         output_dir = str(output_dir or '').strip()
         if not output_dir:
@@ -2128,14 +2085,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         default_config.use_cuda = bool(getattr(self, 'acceleration_info', {}).get('prefer_gpu', True))
         self._apply_loaded_config(default_config, announce='已恢复默认配置')
     def refresh_runtime_strip(self):
-        if bool(getattr(self, '_app_closing', False)):
-            return
-        if threading.current_thread() is not threading.main_thread():
-            try:
-                self.run_on_ui(self.refresh_runtime_strip)
-            except Exception:
-                pass
-            return
         runtime = self.acceleration_info.get('device_text', 'CPU') if hasattr(self, 'acceleration_info') else 'CPU'
         realtime_text = '开启' if self.config.enable_realtime_segmentation else '关闭'
         seg_name = Path(getattr(self, 'onnx_model_path', '') or getattr(self.config, 'active_seg_model', '') or '').name or '未加载'
@@ -2682,12 +2631,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             else:
                 if include_any is None:
                     include_any = not (probe_mode and bool(getattr(self.config, 'camera_search_disable_cap_any_probe', True)))
-                    if (not probe_mode) and (not bool(getattr(self.config, 'camera_b_runtime_allow_cap_any', False))):
-                        include_any = False
-                if probe_mode:
-                    backend_candidates = self.iter_camera_probe_backends(source, include_any=include_any)
-                else:
-                    backend_candidates = self._camera_b_runtime_backends(source, include_any=bool(include_any and getattr(self.config, 'camera_b_runtime_allow_cap_any', False)))
+                backend_candidates = self.iter_camera_probe_backends(source, include_any=include_any)
                 if not allow_fallback and backend_candidates:
                     backend_candidates = backend_candidates[:1]
         else:
@@ -2705,9 +2649,10 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                     if cap is not None:
                         cap.release()
                     continue
-                self._configure_camera_b_capture(cap, backend)
-                if not probe_mode:
-                    self._apply_camera_b_fourcc(cap)
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
                 ok = False
                 for _ in range(max(1, validation_reads)):
                     ret, frame = cap.read()
@@ -2766,140 +2711,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             cv2.CAP_ANY: 'AUTO',
         }
         return mapping.get(backend, str(backend))
-
-    def _next_camera_b_session_id(self):
-        self.camera_b_session_id = int(getattr(self, 'camera_b_session_id', 0) or 0) + 1
-        return self.camera_b_session_id
-
-    def _set_camera_b_capture_guard(self, active):
-        depth = int(getattr(self, '_camera_b_capture_guard_depth', 0) or 0)
-        if active:
-            depth += 1
-        else:
-            depth = max(0, depth - 1)
-        self._camera_b_capture_guard_depth = depth
-        if active:
-            self.camera_b_pause_until = max(float(getattr(self, 'camera_b_pause_until', 0.0) or 0.0), time.time() + 0.2)
-            self.camera_b_read_failures = 0
-
-    def _camera_b_runtime_backends(self, source, include_any=False):
-        if not isinstance(source, int):
-            return [cv2.CAP_ANY]
-        preferred_name = self._resolve_camera_backend_name(getattr(self.config, 'camera_b_runtime_preferred_backend', 'DSHOW'))
-        preferred = cv2.CAP_DSHOW if preferred_name == 'DSHOW' else (cv2.CAP_MSMF if preferred_name == 'MSMF' else cv2.CAP_ANY)
-        cached_backend = self.camera_probe_backend_cache.get(int(source))
-        current_backend = getattr(self, 'camera_b_open_backend', None)
-        candidates = []
-        for backend in [current_backend, cached_backend, preferred]:
-            if backend is None:
-                continue
-            if backend not in candidates:
-                candidates.append(backend)
-        if not candidates:
-            candidates.append(preferred)
-        if bool(getattr(self.config, 'camera_b_open_allow_cross_backend', False)):
-            for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF]:
-                if backend not in candidates:
-                    candidates.append(backend)
-        if include_any and cv2.CAP_ANY not in candidates:
-            candidates.append(cv2.CAP_ANY)
-        return candidates
-
-    def _apply_camera_b_fourcc(self, cap):
-        if cap is None:
-            return
-        fourcc_name = str(getattr(self.config, 'camera_b_preferred_fourcc', 'AUTO') or 'AUTO').strip().upper()
-        if not fourcc_name or fourcc_name == 'AUTO':
-            return
-        if len(fourcc_name) != 4:
-            return
-        try:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc_name))
-        except Exception:
-            pass
-
-    def _normalize_status_text(self, text, max_chars=78):
-        text = ' '.join(str(text or '').replace('\r', ' ').replace('\n', ' | ').split())
-        if max_chars and len(text) > int(max_chars):
-            return text[:max(0, int(max_chars) - 1)].rstrip() + '…'
-        return text
-
-    def _set_elided_label_text(self, label, text, tooltip_text=None):
-        if label is None:
-            return
-        raw = ' '.join(str(text or '').replace('\r', ' ').replace('\n', ' | ').split())
-        metrics = label.fontMetrics()
-        width = max(120, int(label.width()) - 6)
-        elided = metrics.elidedText(raw, Qt.ElideRight, width) if metrics is not None else raw
-        label.setText(elided)
-        full_tip = str(tooltip_text if tooltip_text is not None else raw)
-        label.setToolTip(full_tip if full_tip else '')
-
-    def _pause_camera_b_temporarily(self, duration_ms=None, reason='camera_a_capture'):
-        try:
-            if not bool(getattr(self.config, 'camera_b_pause_during_camera_a_capture', True)):
-                return
-            duration_ms = int(duration_ms if duration_ms is not None else getattr(self.config, 'camera_b_pause_after_camera_a_capture_ms', 900))
-            if duration_ms <= 0:
-                return
-            until = time.time() + max(0.05, duration_ms / 1000.0)
-            self.camera_b_pause_until = max(float(getattr(self, 'camera_b_pause_until', 0.0) or 0.0), until)
-            guard_ms = max(0, int(getattr(self.config, 'camera_b_stabilize_after_pause_ms', 600) or 600))
-            self.camera_b_resume_guard_until = max(float(getattr(self, 'camera_b_resume_guard_until', 0.0) or 0.0), until + guard_ms / 1000.0)
-            self.camera_b_read_failures = 0
-        except Exception:
-            pass
-
-    def _camera_b_is_paused(self):
-        if int(getattr(self, '_camera_b_capture_guard_depth', 0) or 0) > 0:
-            return True
-        return time.time() < float(getattr(self, 'camera_b_pause_until', 0.0) or 0.0)
-
-    def _sanitize_camera_b_frame(self, frame):
-        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
-            return None
-        try:
-            if frame.ndim == 2:
-                work = frame
-            elif frame.ndim == 3 and frame.shape[2] in (1, 3, 4):
-                work = frame
-            else:
-                return None
-            if work.dtype == np.uint16:
-                work = cv2.convertScaleAbs(work, alpha=(255.0 / max(1.0, float(np.max(work)))))
-            elif work.dtype != np.uint8:
-                work = np.clip(work, 0, 255).astype(np.uint8, copy=False)
-            if work.ndim == 3 and work.shape[2] == 1:
-                work = work[:, :, 0]
-            if work.ndim == 2:
-                work = cv2.cvtColor(work, cv2.COLOR_GRAY2BGR)
-            elif work.ndim == 3 and work.shape[2] == 4:
-                work = cv2.cvtColor(work, cv2.COLOR_BGRA2BGR)
-            h, w = work.shape[:2]
-            if h < 32 or w < 32:
-                return None
-            return np.ascontiguousarray(work)
-        except Exception:
-            return None
-
-    def _configure_camera_b_capture(self, cap, backend=None):
-        if cap is None:
-            return
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        try:
-            cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-        except Exception:
-            pass
-        self._apply_camera_b_fourcc(cap)
-        try:
-            max_fps = int(getattr(self.config, 'max_preview_fps', 0) or 0)
-            if max_fps > 0:
-                cap.set(cv2.CAP_PROP_FPS, float(max_fps))
-        except Exception:
-            pass
     def open_camera_b_diagnostics(self):
         dialog = getattr(self, '_camera_b_diag_dialog', None)
         if dialog is None:
@@ -3458,8 +3269,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             return None
         return None
     def _schedule_camera_b_reconnect(self, reason='unknown'):
-        if bool(getattr(self, '_app_closing', False)):
-            return
         if not bool(getattr(self.config, 'camera_b_auto_reconnect', True)):
             return
         if getattr(self, '_camera_b_reconnect_pending', False):
@@ -3468,9 +3277,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self._camera_b_reconnect_reason = str(reason or 'unknown')
         self.run_on_ui(self._perform_camera_b_reconnect)
     def _perform_camera_b_reconnect(self):
-        if bool(getattr(self, '_app_closing', False)):
-            self._camera_b_reconnect_pending = False
-            return
         source = getattr(self, 'current_device_index', None)
         if source is None:
             self._camera_b_reconnect_pending = False
@@ -3481,7 +3287,6 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         except Exception:
             pass
         self.is_running_b = False
-        self._next_camera_b_session_id()
         try:
             current_thread = threading.current_thread()
             if self.video_thread_b and self.video_thread_b.is_alive() and self.video_thread_b is not current_thread:
@@ -3489,26 +3294,18 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         except Exception:
             pass
         try:
-            with self.camera_b_lock:
-                if self.camera_b is not None:
-                    self.camera_b.release()
-                self.camera_b = None
-                self.current_camera_b_backend = None
+            if self.camera_b is not None:
+                self.camera_b.release()
         except Exception:
             pass
+        self.camera_b = None
+        self.current_camera_b_backend = None
         self.camera_b_last_frame_ts = 0.0
         self.camera_b_read_failures = 0
-        preferred_backend = getattr(self, 'camera_b_open_backend', None)
-        backend_override = None
-        allow_fallback = True
-        if preferred_backend is not None and bool(getattr(self.config, 'camera_b_reconnect_keep_backend', True)):
-            backend_override = [preferred_backend]
-            allow_fallback = bool(getattr(self.config, 'camera_b_reconnect_allow_cross_backend', False))
-        cap, backend = self.open_video_capture(source, backend_candidates_override=backend_override, allow_fallback=allow_fallback, include_any=False)
+        cap, backend = self.open_video_capture(source)
         if cap is None or not cap.isOpened():
-            with self.camera_b_lock:
-                self.camera_b = None
-                self.current_camera_b_backend = None
+            self.camera_b = None
+            self.current_camera_b_backend = None
             max_attempts = max(1, int(getattr(self.config, 'camera_b_reconnect_max_attempts', 3)))
             if self._camera_b_reconnect_attempts < max_attempts:
                 delay_ms = max(300, int(getattr(self.config, 'camera_b_reconnect_retry_delay_ms', 1200)))
@@ -3526,16 +3323,16 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                 self.camera_b_display.setText('普通相机 B 自动恢复失败，请手动重新打开设备。')
                 return
             return
-        self._configure_camera_b_capture(cap, backend)
-        with self.camera_b_lock:
-            self.camera_b = cap
-            self.current_camera_b_backend = backend
-            self.camera_b_open_backend = backend
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        self.camera_b = cap
+        self.current_camera_b_backend = backend
         self.camera_b_last_frame_ts = time.time()
         self.camera_b_read_failures = 0
         self.is_running_b = True
-        session_id = self._next_camera_b_session_id()
-        self.video_thread_b = threading.Thread(target=self.video_loop_b, args=(session_id,), daemon=True)
+        self.video_thread_b = threading.Thread(target=self.video_loop_b, daemon=True)
         self.video_thread_b.start()
         self.open_close_b_btn.setText('⏹️ 关闭设备')
         self.find_b_btn.setEnabled(False)
@@ -3553,22 +3350,9 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.final_display.setText('未检测到有效裂缝')
         QMessageBox.warning(self, '提示', message)
     def display_image(self, image, label):
-        if image is None or label is None or bool(getattr(self, '_app_closing', False)):
+        if image is None:
             return
-        if threading.current_thread() is not threading.main_thread():
-            try:
-                queued = np.ascontiguousarray(image).copy() if isinstance(image, np.ndarray) else image.copy()
-            except Exception:
-                queued = image
-            try:
-                self.run_on_ui(lambda img=queued, lbl=label: self.display_image(img, lbl))
-            except Exception:
-                pass
-            return
-        try:
-            display_img = self.normalize_frame_orientation(image)
-        except RuntimeError:
-            return
+        display_img = self.normalize_frame_orientation(image)
         key = self.display_label_keys.get(id(label)) if hasattr(self, 'display_label_keys') else None
         if key is not None:
             try:
@@ -3624,10 +3408,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         q_img = self._qimage_from_numpy(view_img)
         if q_img is None:
             return
-        try:
-            label.setPixmap(QPixmap.fromImage(q_img))
-        except RuntimeError:
-            return
+        label.setPixmap(QPixmap.fromImage(q_img))
         if self.zoom_dialog is not None and self.zoom_dialog.isVisible() and key is not None and self.current_zoom_key == key:
             current_title = self.zoom_dialog.windowTitle()
             self._queue_zoom_dialog_update(display_img, current_title)
@@ -3723,52 +3504,25 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         return max_radius, max_center, skeleton, dist_transform
     
     def closeEvent(self, event):
-        if not bool(getattr(self, '_app_closing', False)):
-            reply = QMessageBox.question(
-                self, "退出确认",
-                "是否确认退出程序？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                event.ignore()
-                return
-        self._app_closing = True
-        try:
-            for timer_name in ['ui_refresh_timer', 'fps_update_timer', 'laser_poll_timer', 'zoom_live_update_timer', 'live_layout_debounce_timer', 'status_layout_debounce_timer', 'model_status_debounce_timer']:
-                timer = getattr(self, timer_name, None)
-                if timer is not None:
-                    try:
-                        timer.stop()
-                    except Exception:
-                        pass
-            self.persist_window_geometry()
-            self.realtime_worker_stop = True
-            self.realtime_worker_event.set()
-            self.is_running_b = False
-            self.PictureDeal_is_running = False
+        reply = QMessageBox.question(
+            self, "退出确认",
+            "是否确认退出程序？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
             try:
+                self.persist_window_geometry()
+                self.realtime_worker_stop = True
+                self.realtime_worker_event.set()
+                self.is_running_b = False
+                self.PictureDeal_is_running = False
                 self.toggle_camera_a(True)
-            except Exception:
-                pass
-            try:
                 self.toggle_camera_b(True)
-            except Exception:
-                pass
-            worker = getattr(self, 'realtime_worker_thread', None)
-            if worker is not None and worker.is_alive() and worker is not threading.current_thread():
-                try:
-                    worker.join(timeout=1.5)
-                except Exception:
-                    pass
-            fp = getattr(self, '_runtime_crash_log_fp', None)
-            if fp is not None:
-                try:
-                    fp.flush()
-                except Exception:
-                    pass
-        finally:
-            event.accept()
+            finally:
+                event.accept()
+        else:
+            event.ignore()
     def show_context_menu(self, position):
         """显示右键菜单"""
         menu = QMenu()

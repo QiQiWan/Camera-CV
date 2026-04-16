@@ -589,7 +589,10 @@ class mvCamera_control:
     def get_latest_preview_frame(self):
         if self.obj_cam_operation is not None and hasattr(self.obj_cam_operation, 'Get_latest_preview_frame'):
             try:
-                return self.obj_cam_operation.Get_latest_preview_frame()
+                frame = self.obj_cam_operation.Get_latest_preview_frame()
+                if frame is None:
+                    return None
+                return frame.copy()
             except Exception:
                 return None
         return None
@@ -601,6 +604,36 @@ class mvCamera_control:
             except Exception:
                 return None
         return None
+
+    def recover_preview_stream(self):
+        if self.obj_cam_operation is None or not self.isOpen:
+            self.last_error = 'Camera not opened.'
+            return False, self.last_error
+        try:
+            self._apply_preview_parameters()
+        except Exception:
+            pass
+        try:
+            self.obj_cam_operation.Set_trigger_mode(False)
+        except Exception:
+            pass
+        try:
+            self.obj_cam_operation.Stop_grabbing()
+        except Exception:
+            pass
+        time.sleep(0.12)
+        try:
+            display_handle = int(getattr(self.obj_cam_operation, 'win_handle', 0) or 0)
+            ret = int(self.obj_cam_operation.Start_grabbing(display_handle, 0))
+            if ret == 0:
+                self.isGrabbing = True
+                self.last_error = ''
+                return True, 'preview stream restarted'
+            self.last_error = 'Preview recover failed ret:' + ToHexStr(ret)
+            return False, self.last_error
+        except Exception as exc:
+            self.last_error = f'Preview recover exception: {exc}'
+            return False, self.last_error
 
     def get_capture_sequence(self) -> int:
         if self.obj_cam_operation is not None and hasattr(self.obj_cam_operation, 'Get_capture_sequence'):
