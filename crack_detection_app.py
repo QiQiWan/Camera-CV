@@ -1419,7 +1419,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             self.status_camera_a_card['frame'].setVisible(enable_a)
         if not enable_a and getattr(self, 'cameraA', None) is not None:
             try:
-                if bool(getattr(self.cameraA, 'b_open_device', False)):
+                if bool(getattr(self.cameraA, 'isOpen', False)):
                     self.toggle_camera_a(True)
             except Exception:
                 pass
@@ -2200,7 +2200,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             return '未初始化', '工业相机控制器尚未创建', 'danger'
         opened = False
         try:
-            opened = bool(getattr(self.cameraA, 'b_open_device', False))
+            opened = bool(getattr(self.cameraA, 'isOpen', False))
         except Exception:
             opened = False
         if not opened:
@@ -2694,7 +2694,7 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             source = index_or_source
             backend_candidates = list(backend_candidates_override) if backend_candidates_override is not None else [cv2.CAP_ANY]
             include_any = True
-        validation_reads = int(min_reads or (getattr(self.config, 'camera_search_probe_reads', 1) if probe_mode else 2))
+        validation_reads = int(min_reads or (getattr(self.config, 'camera_search_probe_reads', 1) if probe_mode else getattr(self.config, 'camera_b_open_validation_reads', 1)))
         read_delay_s = (float(getattr(self.config, 'camera_search_probe_delay_ms', 2)) / 1000.0) if probe_mode else 0.02
         for backend in backend_candidates:
             cap = None
@@ -3483,17 +3483,18 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.is_running_b = False
         self._next_camera_b_session_id()
         try:
-            current_thread = threading.current_thread()
-            if self.video_thread_b and self.video_thread_b.is_alive() and self.video_thread_b is not current_thread:
-                self.video_thread_b.join(timeout=1.0)
+            with self.camera_b_lock:
+                old_cap = self.camera_b
+                self.camera_b = None
+                self.current_camera_b_backend = None
+            if old_cap is not None:
+                old_cap.release()
         except Exception:
             pass
         try:
-            with self.camera_b_lock:
-                if self.camera_b is not None:
-                    self.camera_b.release()
-                self.camera_b = None
-                self.current_camera_b_backend = None
+            current_thread = threading.current_thread()
+            if self.video_thread_b and self.video_thread_b.is_alive() and self.video_thread_b is not current_thread:
+                self.video_thread_b.join(timeout=max(0.05, float(getattr(self.config, 'camera_b_close_join_timeout_ms', 220) or 220) / 1000.0))
         except Exception:
             pass
         self.camera_b_last_frame_ts = 0.0

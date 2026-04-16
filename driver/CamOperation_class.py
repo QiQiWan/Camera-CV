@@ -69,6 +69,9 @@ class CameraOperation:
         self.use_hw_display = False
         self.win_handle = 0
         self._thread_stop = threading.Event()
+        self.state_lock = threading.RLock()
+        self.grab_timeout_ms = 80
+        self.stop_join_timeout_s = 0.35
         self.last_pixel_type = None
         self.last_pixel_type_name = ''
         self.preview_fail_count = 0
@@ -138,42 +141,66 @@ class CameraOperation:
         return MV_OK
 
     def Start_grabbing(self, winHandle, picture=None):
-        if self.b_start_grabbing or (not self.b_open_device):
-            return MV_E_CALLORDER
-        self.b_exit = False
-        self.win_handle = int(winHandle or 0)
-        self.use_hw_display = bool(self.use_hw_display and self.win_handle)
-        try:
-            self.obj_cam.MV_CC_SetImageNodeNum(3)
-        except Exception:
-            pass
-        ret = int(self.obj_cam.MV_CC_StartGrabbing())
-        if ret != 0:
-            return ret
-        self.b_start_grabbing = True
-        self.h_thread_handle = threading.Thread(target=self.Work_thread, args=(self.win_handle,), daemon=True)
-        self.h_thread_handle.start()
-        self.b_thread_closed = True
-        return MV_OK
+        with self.state_lock:
+            if self.b_start_grabbing or (not self.b_open_device):
+                return MV_E_CALLORDER
+            self.b_exit = False
+            self.win_handle = int(winHandle or 0)
+            self.use_hw_display = bool(self.use_hw_display and self.win_handle)
+            self._thread_stop.clear()
+            self.preview_fail_count = 0
+            self.preview_success_count = 0
+            self.last_error = ''
+            with self.preview_lock:
+                self.latest_preview_frame = None
+            try:
+                self.obj_cam.MV_CC_SetImageNodeNum(3)
+            except Exception:
+                pass
+            ret = int(self.obj_cam.MV_CC_StartGrabbing())
+            if ret != 0:
+                return ret
+            self.b_start_grabbing = True
+            self.h_thread_handle = threading.Thread(target=self.Work_thread, args=(self.win_handle,), daemon=True)
+            self.h_thread_handle.start()
+            self.b_thread_closed = True
+            return MV_OK
 
     def Stop_grabbing(self):
-        if not self.b_start_grabbing:
-            return MV_E_CALLORDER
-        self.b_exit = True
-        self._thread_stop.set()
-        if self.h_thread_handle and self.h_thread_handle.is_alive():
-            self.h_thread_handle.join(timeout=1.5)
-        ret = int(self.obj_cam.MV_CC_StopGrabbing())
-        if ret == 0:
+        with self.state_lock:
+            if not self.b_start_grabbing:
+                return MV_E_CALLORDER
+            self.b_exit = True
+            self._thread_stop.set()
+            ret = MV_OK
+            try:
+                ret = int(self.obj_cam.MV_CC_StopGrabbing())
+            except Exception:
+                ret = MV_E_FAIL
+            worker = self.h_thread_handle
+        if worker and worker.is_alive():
+            try:
+                worker.join(timeout=max(0.05, float(getattr(self, 'stop_join_timeout_s', 0.35) or 0.35)))
+            except Exception:
+                pass
+        with self.state_lock:
             self.b_start_grabbing = False
             self.b_thread_closed = False
+            self.h_thread_handle = None
         return ret
 
     def Close_device(self):
-        if self.b_start_grabbing:
-            self.Stop_grabbing()
+        try:
+            if self.b_start_grabbing:
+                self.Stop_grabbing()
+        except Exception:
+            pass
+        ret = MV_OK
         if self.b_open_device:
-            ret = int(self.obj_cam.MV_CC_CloseDevice())
+            try:
+                ret = int(self.obj_cam.MV_CC_CloseDevice())
+            except Exception:
+                ret = MV_E_FAIL
             if ret != 0:
                 return ret
         try:
@@ -184,6 +211,10 @@ class CameraOperation:
         self.b_start_grabbing = False
         self.b_exit = True
         self._thread_stop.set()
+        with self.preview_lock:
+            self.latest_preview_frame = None
+        with self.capture_lock:
+            self.latest_capture_frame = None
         return MV_OK
 
     def Set_trigger_mode(self, is_trigger_mode):
@@ -404,7 +435,7 @@ class CameraOperation:
         while not self._thread_stop.is_set():
             got_buffer = False
             try:
-                ret = int(self.obj_cam.MV_CC_GetImageBuffer(stOutFrame, 200))
+                ret = int(self.obj_cam.MV_CC_GetImageBuffer(stOutFrame, max(20, int(getattr(self, 'grab_timeout_ms', 80) or 80))))
                 if ret != 0:
                     if self.b_exit:
                         break

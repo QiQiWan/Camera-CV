@@ -25,6 +25,7 @@ class CameraFlowMixin:
             current_index = self.camera_a_combo_box.currentData()
             if current_index is None:
                 current_index = self.camera_a_combo_box.currentIndex()
+            self._stop_camera_a_stream(clear_ui=False)
             try:
                 self.cameraA.configure_preview_profile(
                     exposure_us=self.config.mv_preview_exposure_us,
@@ -62,36 +63,17 @@ class CameraFlowMixin:
                 self.update_model_status_label(message + f"\n工业相机A预览配置：Exposure={self.config.mv_preview_exposure_us:.0f}us | AutoExposure={'On' if self.config.mv_preview_auto_exposure else 'Off'} | PixelFormat={'Mono8' if self.config.mv_preview_force_mono8 else '原始'} | TargetFPS={self.config.mv_preview_target_fps if self.config.mv_preview_target_fps > 0 else 'max'}")
                 self._camera_a_preview_recover_last_ts = 0.0
                 self.is_running_a = True
-                if self.video_thread_a and self.video_thread_a.is_alive():
-                    self.video_thread_a.join(timeout=0.5)
                 self.video_thread_a = threading.Thread(target=self.video_loop_a, daemon=True)
                 self.video_thread_a.start()
             else:
                 QMessageBox.critical(self, "打开失败", f"无法打开海康MV相机 {current_index}: {info}")
         else:
-            self.is_running_a = False
-            if self.video_thread_a and self.video_thread_a.is_alive():
-                self.video_thread_a.join(timeout=1.0)
-            self.PictureDeal_is_running = False
-            _closed, _info = self.cameraA.close_device()
+            self._stop_camera_a_stream(clear_ui=True)
             self.open_close_a_btn.setText("▶️ 打开设备")
             self.find_a_btn.setEnabled(True)
             self.camera_a_combo_box.setEnabled(True)
-            self.capture_a_btn.setEnabled(False)
-            self.save_a_btn.setEnabled(False)
             self.camera_a_connection.setEnabled(True)
-            self.camera_a_display.setText("工业相机 A 已停止")
-            self.main_display.setText("等待图像输入...")
-            self.seg_display.setText("等待图像获取")
-            self.transform_display.setText("变换结果")
-            self.final_display.setText("最终结果")
-            self.latest_realtime_overlay = None
-            self.latest_realtime_result = None
-            self.latest_stable_mask_visual = None
-            self.latest_live_signature = ''
-            self.latest_stable_mask = None
-            self.latest_stable_mask_visual = None
-            self.latest_live_signature = ''
+            self.camera_a_input.setEnabled(True)
             self.reset_preview_stabilization()
 
 
@@ -165,12 +147,117 @@ class CameraFlowMixin:
         return frame
 
 
+    def _camera_streams_are_isolated(self):
+        return bool(getattr(self.config, 'camera_streams_fully_isolated', True))
+
+
+    def _camera_a_capture_should_pause_b(self):
+        if self._camera_streams_are_isolated():
+            return False
+        return bool(getattr(self.config, 'camera_a_capture_pause_camera_b', getattr(self.config, 'camera_b_pause_during_camera_a_capture', False)))
+
+
+    def _reset_camera_b_runtime_visuals(self, clear_labels=False):
+        self.latest_realtime_overlay = None
+        self.latest_realtime_result = None
+        self.latest_realtime_message = ''
+        self.latest_stable_overlay = None
+        self.latest_stable_result = None
+        self.latest_stable_mask = None
+        self.latest_stable_mask_visual = None
+        self.latest_live_signature = ''
+        self.last_realtime_measurement = None
+        self.last_realtime_measure_ts = 0.0
+        self.realtime_status_counter = 0
+        self.realtime_measure_counter = 0
+        if clear_labels:
+            try:
+                self.main_display.setText('等待图像输入...')
+                self.transform_display.setText('普通相机B实时裂缝阴影遮罩')
+            except Exception:
+                pass
+
+
+    def _reset_camera_a_capture_state(self, clear_labels=False):
+        self.frame_a_capture = None
+        self.picturename_a = None
+        self.final_result_a = None
+        self.last_detection_result_a = None
+        if clear_labels:
+            try:
+                self.camera_a_display.setText('工业相机 A 已停止')
+                self.seg_display.setText('等待图像获取')
+                self.final_display.setText('最终结果')
+            except Exception:
+                pass
+
+
+    def _stop_camera_b_stream(self, clear_ui=False):
+        self.is_running_b = False
+        self._next_camera_b_session_id()
+        with self.camera_b_lock:
+            cap = self.camera_b
+            self.camera_b = None
+            self.current_camera_b_backend = None
+            self.camera_b_open_backend = None
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        worker = getattr(self, 'video_thread_b', None)
+        self.video_thread_b = None
+        if worker is not None and worker is not threading.current_thread():
+            try:
+                worker.join(timeout=max(0.05, float(getattr(self.config, 'camera_b_close_join_timeout_ms', 220) or 220) / 1000.0))
+            except Exception:
+                pass
+        self.camera_b_last_frame_ts = 0.0
+        self.camera_b_pause_until = 0.0
+        self.camera_b_resume_guard_until = 0.0
+        self.camera_b_read_failures = 0
+        self._camera_b_capture_guard_depth = 0
+        self._camera_b_reconnect_pending = False
+        self._camera_b_reconnect_attempts = 0
+        self.preview_fps_timestamps.clear()
+        self.display_fps_timestamps.clear()
+        self.inference_fps_timestamps.clear()
+        self.update_fps_status_label()
+        if clear_ui:
+            self.capture_b_btn.setEnabled(False)
+            self.save_b_btn.setEnabled(False)
+            self.camera_b_display.setText('相机B已停止')
+            self._reset_camera_b_runtime_visuals(clear_labels=True)
+
+
+    def _stop_camera_a_stream(self, clear_ui=False):
+        self.is_running_a = False
+        worker = getattr(self, 'video_thread_a', None)
+        self.video_thread_a = None
+        try:
+            if getattr(self, 'cameraA', None) is not None:
+                self.cameraA.close_device()
+        except Exception:
+            pass
+        if worker is not None and worker is not threading.current_thread():
+            try:
+                worker.join(timeout=max(0.05, float(getattr(self.config, 'camera_a_close_join_timeout_ms', 220) or 220) / 1000.0))
+            except Exception:
+                pass
+        self.PictureDeal_is_running = False
+        self._camera_a_preview_recover_last_ts = 0.0
+        if clear_ui:
+            self.capture_a_btn.setEnabled(False)
+            self.save_a_btn.setEnabled(False)
+            self._reset_camera_a_capture_state(clear_labels=True)
+
+
     def capture_image_a(self):
         if self.deal_picture_flag:
             QMessageBox.warning(self, "错误", "当前已有图像正在处理中，请稍后尝试！")
             return
         try:
-            if bool(getattr(self.config, 'camera_b_pause_during_camera_a_capture', True)):
+            if self._camera_a_capture_should_pause_b():
                 self._set_camera_b_capture_guard(True)
                 self._pause_camera_b_temporarily(reason='camera_a_capture_start')
             self.deal_picture_flag = 1
@@ -184,7 +271,7 @@ class CameraFlowMixin:
                     except Exception:
                         prev_seq = None
                     break
-            temp_picture = os.path.join(self.base_dir, 'temp.jpg')
+            temp_picture = os.path.join(self.base_dir, str(getattr(self.config, 'camera_a_capture_temp_name', 'temp_cam_a.jpg') or 'temp_cam_a.jpg'))
             temp_picture_candidates = [temp_picture, os.path.abspath('./temp.jpg')]
             if bool(getattr(self.config, 'camera_a_capture_remove_stale_temp', True)):
                 for _tmp_path in temp_picture_candidates:
@@ -245,7 +332,7 @@ class CameraFlowMixin:
             QMessageBox.critical(self, '错误', f'摄像头A抓拍失败: {exc}')
             self.save_a_btn.setEnabled(False)
         finally:
-            if bool(getattr(self.config, 'camera_b_pause_during_camera_a_capture', True)):
+            if self._camera_a_capture_should_pause_b():
                 self._set_camera_b_capture_guard(False)
                 self._pause_camera_b_temporarily(reason='camera_a_capture_finish')
             self.deal_picture_flag = 0
@@ -291,8 +378,8 @@ class CameraFlowMixin:
 
     def save_result_a(self):
         notice_mes = '保存'
-        camera_a_result = getattr(self, 'final_result_a', None) or self.final_result
-        camera_a_detection = getattr(self, 'last_detection_result_a', None) or self.last_detection_result
+        camera_a_result = getattr(self, 'final_result_a', None)
+        camera_a_detection = getattr(self, 'last_detection_result_a', None)
         if self.frame_a_capture is not None and self.picturename_a is not None and camera_a_result is not None:
             try:
                 org_filename, out_filename = self.save_detection_artifacts(
@@ -323,6 +410,7 @@ class CameraFlowMixin:
             current_index = self.camera_b_combo_box.currentData()
             if current_index is None:
                 current_index = self.camera_b_combo_box.currentText().strip()
+            self._stop_camera_b_stream(clear_ui=False)
             cap, backend = self.open_video_capture(current_index)
             with self.camera_b_lock:
                 self.camera_b = cap
@@ -345,6 +433,9 @@ class CameraFlowMixin:
             else:
                 self.current_device_index = current_index
                 self._configure_camera_b_capture(cap, backend)
+                warmup_ms = max(0, int(getattr(self.config, 'camera_b_open_warmup_ms', 0) or 0))
+                if warmup_ms > 0:
+                    time.sleep(warmup_ms / 1000.0)
                 self.open_close_b_btn.setText("⏹️ 关闭设备")
                 self.find_b_btn.setEnabled(False)
                 self.capture_b_btn.setEnabled(True)
@@ -364,41 +455,12 @@ class CameraFlowMixin:
                 self.video_thread_b = threading.Thread(target=self.video_loop_b, args=(session_id,), daemon=True)
                 self.video_thread_b.start()
         else:
-            self.is_running_b = False
-            self._next_camera_b_session_id()
-            if self.video_thread_b and self.video_thread_b is not threading.current_thread():
-                self.video_thread_b.join(timeout=1.0)
-            self.video_thread_b = None
-            with self.camera_b_lock:
-                if self.camera_b:
-                    self.camera_b.release()
-                    self.camera_b = None
-                self.current_camera_b_backend = None
-                self.camera_b_open_backend = None
-            self.camera_b_last_frame_ts = 0.0
-            self.camera_b_pause_until = 0.0
-            self.camera_b_resume_guard_until = 0.0
-            self.camera_b_read_failures = 0
-            self._camera_b_capture_guard_depth = 0
-            self._camera_b_reconnect_pending = False
-            self._camera_b_reconnect_attempts = 0
-            self.preview_fps_timestamps.clear()
-            self.display_fps_timestamps.clear()
-            self.inference_fps_timestamps.clear()
-            self.update_fps_status_label()
+            self._stop_camera_b_stream(clear_ui=True)
             self.open_close_b_btn.setText("▶️ 打开设备")
             self.find_b_btn.setEnabled(True)
             self.camera_b_combo_box.setEnabled(True)
-            self.capture_b_btn.setEnabled(False)
-            self.save_b_btn.setEnabled(False)
             self.camera_b_connection.setEnabled(True)
-            self.camera_b_display.setText("相机B已停止")
-            self.main_display.setText("等待图像输入...")
-            self.transform_display.setText("普通相机B实时裂缝阴影遮罩")
-            self.latest_realtime_overlay = None
-            self.latest_realtime_result = None
-            self.latest_stable_mask_visual = None
-            self.latest_live_signature = ''
+            self.camera_b_input.setEnabled(True)
 
 
     def video_loop_b(self, session_id=None):
@@ -422,14 +484,14 @@ class CameraFlowMixin:
                     cap = self.camera_b
                     if cap is None or not cap.isOpened():
                         break
-                    ret, frame = cap.read()
-                    if (not ret or frame is None or getattr(frame, 'size', 0) == 0) and retry_burst > 0:
-                        for _ in range(retry_burst):
-                            if retry_delay_s > 0:
-                                time.sleep(retry_delay_s)
-                            ret, frame = cap.read()
-                            if ret and frame is not None and getattr(frame, 'size', 0) > 0:
-                                break
+                ret, frame = cap.read()
+                if (not ret or frame is None or getattr(frame, 'size', 0) == 0) and retry_burst > 0:
+                    for _ in range(retry_burst):
+                        if retry_delay_s > 0:
+                            time.sleep(retry_delay_s)
+                        ret, frame = cap.read()
+                        if ret and frame is not None and getattr(frame, 'size', 0) > 0:
+                            break
                 safe_frame = self._sanitize_camera_b_frame(frame) if ret else None
                 if safe_frame is not None:
                     consecutive_failures = 0
@@ -930,8 +992,8 @@ class CameraFlowMixin:
 
     def save_result_b(self):
         notice_mes = '保存'
-        camera_b_result = getattr(self, 'final_result_b', None) or self.final_result
-        camera_b_detection = getattr(self, 'last_detection_result_b', None) or self.last_detection_result
+        camera_b_result = getattr(self, 'final_result_b', None)
+        camera_b_detection = getattr(self, 'last_detection_result_b', None)
         if self.frame_b_capture is not None and self.picturename_b is not None and camera_b_result is not None:
             try:
                 org_filename, out_filename = self.save_detection_artifacts(

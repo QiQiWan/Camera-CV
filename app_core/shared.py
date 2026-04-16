@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-APP_VERSION = "P6.8-stability-iteration1"
+APP_VERSION = "P6.9-stream-isolation"
 
 
 class MainThreadExecutor(QObject):
@@ -153,6 +153,13 @@ class SystemConfig:
     camera_b_runtime_preferred_backend: str = 'DSHOW'
     camera_b_open_allow_cross_backend: bool = False
     camera_b_preferred_fourcc: str = 'AUTO'
+    camera_streams_fully_isolated: bool = True
+    camera_b_open_validation_reads: int = 1
+    camera_b_close_join_timeout_ms: int = 220
+    camera_b_open_warmup_ms: int = 0
+    camera_a_close_join_timeout_ms: int = 220
+    camera_a_capture_pause_camera_b: bool = False
+    camera_a_capture_temp_name: str = 'temp_cam_a.jpg'
 
     # 普通相机 B 的细裂缝专用模型配置
     camera_b_use_dedicated_model: bool = True

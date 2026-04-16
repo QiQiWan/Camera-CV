@@ -404,6 +404,8 @@ class mvCamera_control:
             self.obj_cam_operation = CameraOperation(self.cam, self.deviceList, self.nSelCamIndex)
             self.obj_cam_operation.preview_max_long_side = max(480, int(self.preview_long_side))
             self.obj_cam_operation.use_hw_display = bool(self.preview_use_hw_display)
+            self.obj_cam_operation.grab_timeout_ms = 80
+            self.obj_cam_operation.stop_join_timeout_s = 0.35
             if float(self.preview_target_fps) > 0:
                 self.obj_cam_operation.preview_update_interval_s = 1.0 / max(10.0, min(120.0, float(self.preview_target_fps)))
             ret = int(self.obj_cam_operation.Open_device())

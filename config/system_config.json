@@ -125,6 +125,13 @@
   "camera_b_runtime_preferred_backend": "DSHOW",
   "camera_b_open_allow_cross_backend": false,
   "camera_b_preferred_fourcc": "AUTO",
+  "camera_streams_fully_isolated": true,
+  "camera_b_open_validation_reads": 1,
+  "camera_b_close_join_timeout_ms": 220,
+  "camera_b_open_warmup_ms": 0,
+  "camera_a_close_join_timeout_ms": 220,
+  "camera_a_capture_pause_camera_b": false,
+  "camera_a_capture_temp_name": "temp_cam_a.jpg",
   "camera_b_use_dedicated_model": true,
   "camera_b_seg_model": "E:\\OneDrive\\python\\research\\CrackRecognizition\\new_code\\models\\steel_crack_best_model.pth",
   "camera_b_input_size": 896,
@@ -143,7 +150,7 @@
   "ui_preview_fill_camera_a": false,
   "ui_preview_fill_camera_b": false,
   "ui_preview_allow_upscale": true,
-  "ui_show_event_log": true,
+  "ui_show_event_log": false,
   "ui_workspace_mode": "overview",
   "ui_show_quick_mode_bar": true,
   "ui_status_update_min_interval_ms": 120,
@@ -156,15 +163,15 @@
   "ui_restore_window_geometry": true,
   "ui_window_width": 2194,
   "ui_window_height": 1171,
-  "ui_window_x": 10,
-  "ui_window_y": 10,
+  "ui_window_x": 3840,
+  "ui_window_y": -7,
   "ui_root_splitter_sizes": [
     1744,
     430
   ],
   "ui_center_splitter_sizes": [
-    316,
-    402
+    335,
+    612
   ],
   "ui_preview_mode_camera_a": "fit",
   "ui_preview_mode_camera_b": "fit"
