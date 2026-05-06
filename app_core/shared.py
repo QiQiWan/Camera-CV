@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-APP_VERSION = "P6.9-stream-isolation"
+APP_VERSION = "P7.5.1-camera-param-hotfix"
 
 
 class MainThreadExecutor(QObject):
@@ -176,21 +176,22 @@ class SystemConfig:
     camera_a_preview_recover_cooldown_s: float = 5.0
     ui_control_panel_mode: str = 'compact'
     ui_control_panel_hidden: bool = False
-    ui_show_model_config_on_startup: bool = True
+    ui_show_model_config_on_startup: bool = False
     ui_preview_fill_camera_a: bool = True
     ui_preview_fill_camera_b: bool = False
     ui_preview_allow_upscale: bool = True
-    ui_show_event_log: bool = True
+    ui_show_event_log: bool = False
     ui_workspace_mode: str = 'overview'
     ui_show_quick_mode_bar: bool = True
     ui_status_update_min_interval_ms: int = 120
     ui_zoom_live_fps: int = 12
     output_dir: str = 'data'
-    app_display_name: str = 'Crack Detecttion - EatRice Studio'
+    app_display_name: str = '视觉检测仪智能测量系统'
+    ui_layout_revision: str = 'P11-modern-workbench'
     enable_camera_a_module: bool = False
     enable_camera_b_module: bool = True
-    startup_choose_camera_mode: bool = True
-    ui_restore_window_geometry: bool = True
+    startup_choose_camera_mode: bool = False
+    ui_restore_window_geometry: bool = False
     ui_window_width: int = 0
     ui_window_height: int = 0
     ui_window_x: int = -1
@@ -199,6 +200,27 @@ class SystemConfig:
     ui_center_splitter_sizes: list[int] = field(default_factory=list)
     ui_preview_mode_camera_a: str = 'fill'
     ui_preview_mode_camera_b: str = 'fit'
+    # Hardware pose / laser acquisition integration
+    hardware_imu_enabled: bool = True
+    hardware_imu_auto_connect: bool = True
+    hardware_imu_port: str = ''
+    hardware_imu_baudrate: int = 115200
+    hardware_laser_stream_enabled: bool = True
+    hardware_laser_stream_auto_connect: bool = True
+    hardware_laser_stream_port: str = ''
+    hardware_laser_stream_baudrate: int = 230400
+    hardware_laser_frame_size: int = 195
+    hardware_laser_header_byte: int = 170
+    hardware_auto_capture_interval_s: float = 1.0
+    hardware_capture_frame_source: str = 'auto'
+    hardware_session_subdir: str = 'hardware_sessions'
+    hardware_trajectory_max_records: int = 300
+    hardware_geometry_auto_update: bool = True
+    hardware_geometry_warn_tilt_deg: float = 30.0
+    hardware_geometry_use_current_camera_frame: bool = True
+    hardware_camera_param_source: str = 'auto'
+    hardware_camera_params_auto_read: bool = True
+    hardware_camera_params_manual_edit: bool = False
 
 
 @dataclass

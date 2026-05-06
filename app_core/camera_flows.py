@@ -65,6 +65,10 @@ class CameraFlowMixin:
                 self.is_running_a = True
                 self.video_thread_a = threading.Thread(target=self.video_loop_a, daemon=True)
                 self.video_thread_a.start()
+                try:
+                    self.ensure_hardware_auto_connected(trigger='camera_a_open')
+                except Exception:
+                    pass
             else:
                 QMessageBox.critical(self, "打开失败", f"无法打开海康MV相机 {current_index}: {info}")
         else:
@@ -454,6 +458,10 @@ class CameraFlowMixin:
                 session_id = self._next_camera_b_session_id()
                 self.video_thread_b = threading.Thread(target=self.video_loop_b, args=(session_id,), daemon=True)
                 self.video_thread_b.start()
+                try:
+                    self.ensure_hardware_auto_connected(trigger='camera_b_open')
+                except Exception:
+                    pass
         else:
             self._stop_camera_b_stream(clear_ui=True)
             self.open_close_b_btn.setText("▶️ 打开设备")

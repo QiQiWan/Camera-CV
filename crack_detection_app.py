@@ -10,6 +10,7 @@ from dataclasses import asdict
 import time
 import json
 import re
+import math
 import concurrent.futures
 import numpy as np
 from pathlib import Path
@@ -31,6 +32,10 @@ from app_core.shared import APP_VERSION, MainThreadExecutor, SystemConfig, Detec
 from app_core.model_runtime import ModelRuntimeMixin
 from app_core.realtime_processing import RealtimeProcessingMixin
 from app_core.camera_flows import CameraFlowMixin
+from app_core.hardware_integration import (
+    HardwareSessionRecorder, IMUThread, LaserBinaryThread, TrajectoryPreviewWidget,
+    HardwareAutoDetectThread, calculate_center_point_from_pose, estimate_camera_geometry_from_pose, serial_port_names, serial_port_details
+)
 import torch
 import onnxruntime
 try:
@@ -343,6 +348,7 @@ class ModelConfigDialog(QDialog):
         pages = [
             ('模型与实时检测', owner.build_model_config_tab(), ['模型', 'onnx', 'pt', '预览', '实时检测', '帧率', '防抖', '巡检', 'cuda', 'gpu', 'cpu']),
             ('场景 / 测量 / 激光', owner.build_measurement_config_tab(), ['场景', '测量', '激光', '串口', '波特率', '读数命令', '单位', '偏移', '距离']),
+            ('位姿 / 硬件采集', owner.build_hardware_config_tab(), ['IMU', '位姿', '三轴', '激光', '轨迹', '自动采集', '二进制']),
             ('保存与会话', owner.build_session_config_tab(), ['保存', '目录', '导出', '导入', '配置', '会话', '恢复默认', '抓拍']),
             ('快速检查', owner._build_quick_check_page(), ['快速检查', '启动', '排查', '清单', '体检', '模型', '测量', '保存']),
         ]
@@ -491,6 +497,7 @@ class ModelConfigDialog(QDialog):
 class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWidget):
     def __init__(self):
         super().__init__()
+        self.setObjectName('CameraGUIRoot')
         self.base_dir = os.path.abspath(os.path.dirname(__file__)) if '__file__' in globals() else os.getcwd()
         self.config_dir = os.path.join(self.base_dir, 'config')
         self.asset_dir = os.path.join(self.base_dir, 'assets')
@@ -736,13 +743,10 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.camera_a_distance = QLineEdit()  # 实际距离
         self.camera_a_distance.setReadOnly(True)
         self.camera_a_distance.setText("0.00 mm")
-        # # 设置按钮样式
         for btn in [self.find_a_btn, self.open_close_a_btn, self.capture_a_btn, self.save_a_btn]:
-            btn.setMinimumHeight(35)
-            btn.setStyleSheet("QPushButton {background-color: #4a86e8; color: white; border-radius: 5px;}"
-                              "QPushButton:hover {background-color: #3a76d8;}"
-                              "QPushButton:disabled{background-color: #A9A9A9;color:#E0E0E0;}"
-                              )
+            btn.setMinimumHeight(36)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setProperty('variant', 'primary')
         """ 相机B """
         self.save_b_btn = QPushButton("💾 重新保存最近结果")
         self.capture_b_btn = QPushButton("📸 抓拍并自动保存")
@@ -841,13 +845,118 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             self.laser_unit_combo.setCurrentIndex(unit_index)
         self.laser_distance_label = QLabel("激光距离：未读取")
         self.laser_distance_label.setWordWrap(True)
+
+        # Hardware pose/laser acquisition widgets and runtime state
+        self.hardware_imu_thread = None
+        self.hardware_laser_thread = None
+        self.hardware_pose_data = {
+            'timestamp': 0.0, 'x': 0.0, 'y': 0.0, 'z': 0.0,
+            'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+            'raw_x': 0.0, 'raw_y': 0.0, 'raw_z': 0.0,
+            'raw_roll': 0.0, 'raw_pitch': 0.0, 'raw_yaw': 0.0,
+        }
+        self.hardware_distance_m = 0.0
+        self.hardware_geometry_estimate = {}
+        self.hardware_session_dir = None
+        self.hardware_frame_counter = 0
+        self.hardware_auto_capture_enabled = False
+        self.hardware_auto_capture_timer = QTimer(self)
+        self.hardware_auto_capture_timer.timeout.connect(lambda: self.hardware_capture_current_frame(is_auto=True))
+        self.hardware_recorder = HardwareSessionRecorder(self)
+        self.hardware_recorder.saved.connect(self.on_hardware_session_saved)
+        self.hardware_recorder.error_occurred.connect(lambda msg: self.append_runtime_event(msg, level='error'))
+        self.hardware_recorder.status_changed.connect(lambda msg: self.append_runtime_event(msg, level='ok'))
+        self.hardware_imu_port_combo = QComboBox()
+        self.hardware_laser_port_combo = QComboBox()
+        self.hardware_imu_port_combo.setEditable(True)
+        self.hardware_laser_port_combo.setEditable(True)
+        self.hardware_imu_port_combo.setToolTip('六轴位姿模块串口。系统会自动识别 COM 口，也支持手动修正。')
+        self.hardware_laser_port_combo.setToolTip('激光测距模块串口。系统会自动识别 COM 口，也支持手动修正。')
+        self.hardware_imu_baudrate_combo = QComboBox()
+        self.hardware_laser_baudrate_combo = QComboBox()
+        for baud in ['9600', '57600', '115200', '230400', '460800', '921600']:
+            self.hardware_imu_baudrate_combo.addItem(baud)
+            self.hardware_laser_baudrate_combo.addItem(baud)
+        self.hardware_imu_baudrate_combo.setCurrentText(str(int(getattr(self.config, 'hardware_imu_baudrate', 115200))))
+        self.hardware_laser_baudrate_combo.setCurrentText(str(int(getattr(self.config, 'hardware_laser_stream_baudrate', 230400))))
+        self.hardware_refresh_ports_btn = QPushButton('🔄 刷新串口')
+        self.hardware_serial_diag_btn = QPushButton('🩺 硬件诊断')
+        self.hardware_auto_detect_btn = QPushButton('🔎 自动识别并连接')
+        self.hardware_imu_connect_btn = QPushButton('连接六轴')
+        self.hardware_imu_zero_btn = QPushButton('位姿归零')
+        self.hardware_laser_connect_btn = QPushButton('连接激光')
+        self.hardware_new_session_btn = QPushButton('新建硬件会话')
+        self.hardware_capture_btn = QPushButton('采集当前帧')
+        self.hardware_auto_capture_btn = QPushButton('启动自动采集')
+        self.hardware_clear_traj_btn = QPushButton('清空轨迹')
+        for _btn in [
+            self.hardware_refresh_ports_btn, self.hardware_serial_diag_btn, self.hardware_auto_detect_btn,
+            self.hardware_imu_connect_btn, self.hardware_imu_zero_btn, self.hardware_laser_connect_btn,
+            self.hardware_new_session_btn, self.hardware_capture_btn, self.hardware_auto_capture_btn,
+            self.hardware_clear_traj_btn, self.hardware_apply_geometry_btn if hasattr(self, 'hardware_apply_geometry_btn') else None
+        ]:
+            if _btn is not None:
+                _btn.setMinimumHeight(34)
+                _btn.setCursor(Qt.PointingHandCursor)
+        self.hardware_auto_detect_btn.setProperty('variant', 'primary')
+        self.hardware_capture_btn.setProperty('variant', 'success')
+        self.hardware_auto_capture_btn.setProperty('variant', 'success')
+        self.hardware_auto_interval_input = QLineEdit(str(float(getattr(self.config, 'hardware_auto_capture_interval_s', 1.0))))
+        self.hardware_auto_interval_input.setMaximumWidth(80)
+        self.hardware_frame_source_combo = QComboBox()
+        self.hardware_frame_source_combo.addItems(['自动', '普通相机B', '工业相机A', '实时叠加'])
+        source_map = {'auto': '自动', 'camera_b': '普通相机B', 'camera_a': '工业相机A', 'main': '实时叠加'}
+        self.hardware_frame_source_combo.setCurrentText(source_map.get(str(getattr(self.config, 'hardware_capture_frame_source', 'auto')), '自动'))
+        self.hardware_pose_label = QLabel('位置XYZ：0.000 / 0.000 / 0.000 m\n姿态RPY：0.00 / 0.00 / 0.00 °')
+        self.hardware_pose_label.setWordWrap(True)
+        self.hardware_distance_label = QLabel('激光距离：未连接')
+        self.hardware_distance_label.setWordWrap(True)
+        self.hardware_geometry_label = QLabel('尺寸估算：等待相机帧、激光距离和位姿数据')
+        self.hardware_geometry_label.setWordWrap(True)
+        self.hardware_hfov_input = QLineEdit(f"{float(getattr(self.config, 'camera_horizontal_fov_deg', 60.0)):.2f}")
+        self.hardware_hfov_input.setMaximumWidth(74)
+        self.hardware_vfov_input = QLineEdit(f"{float(getattr(self.config, 'camera_vertical_fov_deg', 40.0)):.2f}")
+        self.hardware_vfov_input.setMaximumWidth(74)
+        manual_edit_enabled = bool(getattr(self.config, 'hardware_camera_params_manual_edit', False))
+        self.hardware_hfov_input.setReadOnly(not manual_edit_enabled)
+        self.hardware_vfov_input.setReadOnly(not manual_edit_enabled)
+        self.hardware_hfov_input.setToolTip('默认由当前图像、相机句柄和标定比例自动估计；需要时可点击“手动修正”解锁。')
+        self.hardware_vfov_input.setToolTip('默认由当前图像、相机句柄和标定比例自动估计；需要时可点击“手动修正”解锁。')
+        self.hardware_camera_param_source_combo = QComboBox()
+        self.hardware_camera_param_source_combo.addItems(['自动当前帧', '普通相机B', '工业相机A', '实时叠加'])
+        source_text_map = {'auto': '自动当前帧', 'camera_b': '普通相机B', 'camera_a': '工业相机A', 'main': '实时叠加'}
+        self.hardware_camera_param_source_combo.setCurrentText(source_text_map.get(str(getattr(self.config, 'hardware_camera_param_source', 'auto')), '自动当前帧'))
+        self.hardware_read_camera_params_btn = QPushButton('读取当前相机参数')
+        self.hardware_edit_camera_params_btn = QPushButton('锁定参数' if manual_edit_enabled else '手动修正')
+        self.hardware_apply_geometry_btn = QPushButton('刷新尺寸估计')
+        self.hardware_camera_param_status_label = QLabel('相机参数：等待当前相机帧。')
+        self.hardware_camera_param_status_label.setWordWrap(True)
+        for _btn in [self.hardware_read_camera_params_btn, self.hardware_edit_camera_params_btn, self.hardware_apply_geometry_btn]:
+            _btn.setMinimumHeight(32)
+            _btn.setCursor(Qt.PointingHandCursor)
+        self.hardware_read_camera_params_btn.setProperty('variant', 'primary')
+        self.hardware_apply_geometry_btn.setProperty('variant', 'success')
+        self.hardware_edit_camera_params_btn.setToolTip('一般不需要手动输入。只有在自动读取/标定明显不准时，再解锁视场角进行修正。')
+        self.hardware_apply_geometry_btn.setToolTip('使用当前图像尺寸、激光距离、六轴姿态和自动读取到的相机参数刷新尺寸估计。')
+        self.hardware_link_status_label = QLabel('硬件状态：等待识别。系统会自动区分六轴与激光串口，并输出 XYZ/RPY/距离。')
+        self.hardware_link_status_label.setWordWrap(True)
+        self.hardware_session_label = QLabel('硬件会话：未创建')
+        self.hardware_session_label.setWordWrap(True)
+        self.hardware_frame_count_label = QLabel('已采集：0 帧')
+        self.hardware_detect_status_label = QLabel('自动识别：未开始')
+        self.hardware_detect_status_label.setWordWrap(True)
+        self.hardware_imu_health_label = QLabel('六轴：未连接')
+        self.hardware_imu_health_label.setWordWrap(True)
+        self.hardware_laser_health_label = QLabel('激光：未连接')
+        self.hardware_laser_health_label.setWordWrap(True)
+        self.hardware_last_detection_result = {}
+        self.hardware_autodetect_thread = None
+        self.hardware_trajectory_widget = TrajectoryPreviewWidget(self, max_records=int(getattr(self.config, 'hardware_trajectory_max_records', 300)))
         self.diagnose_b_btn.setToolTip('扫描普通相机索引并显示 DSHOW/MSMF/AUTO 的探测结果。')
         for btn in [self.find_b_btn, self.diagnose_b_btn, self.open_close_b_btn, self.capture_b_btn, self.save_b_btn]:
-            btn.setMinimumHeight(35)
-            btn.setStyleSheet("QPushButton {background-color: #6aa84f; color: white; border-radius: 5px;}"
-                              "QPushButton:hover{background-color: #4a983f;}"
-                              "QPushButton:disabled{background-color: #A9A9A9;color:#E0E0E0;}"
-                              )
+            btn.setMinimumHeight(36)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setProperty('variant', 'success')
         ByteArrayType = ctypes.c_ubyte * 5000 * 5000
         self.buf_save_image = ByteArrayType()
         self.filepath = self._resolve_output_dir_value(getattr(self.config, 'output_dir', 'data'))
@@ -867,12 +976,17 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.refresh_model_registry(initial=True)
         self.refresh_scene_profiles(initial=True)
         self.refresh_laser_ports(initial=True)
+        self.refresh_hardware_ports(initial=True)
         self.apply_selected_models(initial=True, silent=True)
         if self.config.auto_apply_scene_profile:
             self.auto_match_scene_profile_to_segmentation()
             self.apply_selected_scene_profile(silent=True)
         if self.config.laser_auto_connect and self.laser_enable_checkbox.isChecked():
             self.toggle_laser_connection(auto=True)
+        if bool(getattr(self.config, 'hardware_imu_auto_connect', False)):
+            self.toggle_hardware_imu(auto=True)
+        if bool(getattr(self.config, 'hardware_laser_stream_auto_connect', False)):
+            self.toggle_hardware_laser_stream(auto=True)
         self.start_realtime_worker()
         self.ui_refresh_timer.start(max(15, int(getattr(self.config, 'ui_refresh_interval_ms', 33))))
         self.fps_update_timer.start(500)
@@ -881,15 +995,20 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.update_fps_status_label()
     def init_ui(self):
         panel_style = (
-            "QGroupBox {font-weight: bold; border: 1px solid #cfd8e3; border-radius: 8px; margin-top: 12px; background: #ffffff;} "
-            "QGroupBox::title {subcontrol-origin: margin; left: 12px; padding: 0 6px 0 6px;}"
+            "QGroupBox {font-weight: 700; border: 1px solid #e2e8f0; border-radius: 14px; "
+            "margin-top: 14px; background: #ffffff;} "
+            "QGroupBox::title {subcontrol-origin: margin; left: 14px; padding: 0 8px; color:#0f172a;}"
         )
-        frame_style = "background-color: #eef2f7; border: 1px solid #d6dee8; border-radius: 6px; font-size: 16px; color: #445;"
+        frame_style = (
+            "background-color: #0b1220; border: 1px solid #1f2937; border-radius: 14px; "
+            "font-size: 16px; color: #e5e7eb;"
+        )
         screen = self.screen().availableGeometry() if self.screen() else None
         small_screen = bool(screen and (screen.width() <= 1680 or screen.height() <= 980))
         display_min_w = 320 if small_screen else 460
         display_min_h = 180 if small_screen else 250
         def setup_display_label(label, title_text):
+            label.setObjectName('videoDisplay')
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setText(title_text)
             label.setWordWrap(True)
@@ -1023,8 +1142,8 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.model_config_content = self.build_model_config_content(panel_style)
         self.config_summary_label = QLabel('模型配置：准备中')
         self.config_summary_label.setWordWrap(False)
-        self.config_summary_label.setMinimumHeight(40 if small_screen else 46)
-        self.config_summary_label.setMaximumHeight(56 if small_screen else 60)
+        self.config_summary_label.setMinimumHeight(28)
+        self.config_summary_label.setMaximumHeight(34)
         self.config_summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.config_summary_label.setStyleSheet('padding:8px 10px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
         self.runtime_strip_label = QLabel('运行摘要：准备中')
@@ -1067,9 +1186,11 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             self.event_log_toggle_btn.setText('隐藏运行日志' if self.event_log_group.isVisible() else '显示运行日志')
         camera_a_group = build_camera_control_group('工业相机 A 控制', self.camera_a_connection, self.camera_a_input, self.find_a_btn, self.camera_a_combo_box, self.open_close_a_btn, self.capture_a_btn, self.save_a_btn, self.camera_a_position, self.camera_a_width, self.camera_a_distance)
         camera_b_group = build_camera_control_group('普通相机 B 控制', self.camera_b_connection, self.camera_b_input, self.find_b_btn, self.camera_b_combo_box, self.open_close_b_btn, self.capture_b_btn, self.save_b_btn, self.camera_b_position, self.camera_b_width, self.camera_b_distance, extra_find_btn=self.diagnose_b_btn)
+        hardware_group = self.build_hardware_control_group(panel_style)
         self.control_panel_groups = {
             '工业相机A': camera_a_group,
             '普通相机B': camera_b_group,
+            '位姿激光采集': hardware_group,
         }
         expanded_page = QWidget()
         expanded_layout = QVBoxLayout()
@@ -1091,30 +1212,29 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_widget.setLayout(right_layout)
         right_layout.addWidget(panel_stack, 1)
-        panel_toolbar = QHBoxLayout()
-        panel_toolbar.setSpacing(8)
-        self.model_config_button = QPushButton('⚙️ 模型 / 检测配置')
-        self.model_config_button.setMinimumHeight(34)
-        self.choose_output_dir_btn = QPushButton('📁 保存目录')
-        self.choose_output_dir_btn.setMinimumHeight(34)
-        self.open_output_dir_btn = QPushButton('🗂️ 打开目录')
-        self.open_output_dir_btn.setMinimumHeight(34)
-        self.export_runtime_log_btn = QPushButton('📝 导出日志')
-        self.export_runtime_log_btn.setMinimumHeight(34)
-        self.restore_layout_btn = QPushButton('🧭 恢复布局')
-        self.restore_layout_btn.setMinimumHeight(34)
+        self.model_config_button = QPushButton('模型 / 检测配置')
+        self.model_config_button.setMinimumHeight(36)
+        self.model_config_button.setProperty('variant', 'primary')
+        self.choose_output_dir_btn = QPushButton('保存目录')
+        self.choose_output_dir_btn.setMinimumHeight(36)
+        self.open_output_dir_btn = QPushButton('打开目录')
+        self.open_output_dir_btn.setMinimumHeight(36)
+        self.export_runtime_log_btn = QPushButton('导出日志')
+        self.export_runtime_log_btn.setMinimumHeight(36)
+        self.restore_layout_btn = QPushButton('恢复布局')
+        self.restore_layout_btn.setMinimumHeight(36)
         self.preview_mode_a_combo = QComboBox()
         self.preview_mode_a_combo.addItems(['工业A预览: 填充', '工业A预览: 适配'])
         self.preview_mode_b_combo = QComboBox()
         self.preview_mode_b_combo.addItems(['普通B预览: 填充', '普通B预览: 适配'])
         self.preview_mode_a_combo.setCurrentText('工业A预览: 填充' if self.camera_a_display.property('display_mode') == 'fill' else '工业A预览: 适配')
         self.preview_mode_b_combo.setCurrentText('普通B预览: 填充' if self.camera_b_display.property('display_mode') == 'fill' else '普通B预览: 适配')
-        self.event_log_toggle_btn = QPushButton('隐藏运行日志')
-        self.event_log_toggle_btn.setMinimumHeight(34)
-        self.event_log_clear_btn = QPushButton('🧹 清空日志')
-        self.event_log_clear_btn.setMinimumHeight(34)
+        self.event_log_toggle_btn = QPushButton('显示运行日志' if not bool(getattr(self.config, 'ui_show_event_log', False)) else '隐藏运行日志')
+        self.event_log_toggle_btn.setMinimumHeight(36)
+        self.event_log_clear_btn = QPushButton('清空日志')
+        self.event_log_clear_btn.setMinimumHeight(36)
         self.control_panel_toggle_btn = QPushButton('隐藏设备面板')
-        self.control_panel_toggle_btn.setMinimumHeight(32)
+        self.control_panel_toggle_btn.setMinimumHeight(36)
         self.control_panel_mode_combo = QComboBox()
         self.control_panel_mode_combo.addItems(['紧凑标签页', '全部展开'])
         desired_mode = str(getattr(self.config, 'ui_control_panel_mode', 'compact' if small_screen else 'expanded'))
@@ -1124,7 +1244,8 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         workspace_mode = str(getattr(self.config, 'ui_workspace_mode', 'overview'))
         workspace_text = {'overview': '总览四宫格', 'live': '实时优先', 'measure': '测量优先'}.get(workspace_mode, '总览四宫格')
         self.workspace_mode_combo.setCurrentText(workspace_text)
-        self.quick_mode_label = QLabel('快速切换:')
+        self.quick_mode_label = QLabel('模式')
+        self.quick_mode_label.setObjectName('toolbarCaption')
         self.quick_mode_normal_btn = QPushButton('普通')
         self.quick_mode_dual_btn = QPushButton('双相机')
         self.quick_view_overview_btn = QPushButton('总览')
@@ -1139,28 +1260,66 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         ]
         for btn in self.quick_mode_buttons:
             btn.setCheckable(True)
-            btn.setMinimumHeight(30)
-        panel_toolbar.addWidget(self.model_config_button, 1)
-        panel_toolbar.addWidget(self.choose_output_dir_btn, 1)
-        panel_toolbar.addWidget(self.open_output_dir_btn, 1)
-        panel_toolbar.addWidget(self.export_runtime_log_btn, 1)
-        panel_toolbar.addWidget(self.restore_layout_btn, 1)
-        panel_toolbar.addWidget(self.preview_mode_a_combo, 1)
-        panel_toolbar.addWidget(self.preview_mode_b_combo, 1)
-        panel_toolbar.addWidget(self.event_log_toggle_btn, 1)
-        panel_toolbar.addWidget(self.event_log_clear_btn, 1)
-        panel_toolbar.addWidget(self.control_panel_toggle_btn, 1)
-        panel_toolbar.addWidget(QLabel('工作区:'), 0)
-        panel_toolbar.addWidget(self.workspace_mode_combo, 1)
-        panel_toolbar.addWidget(QLabel('设备面板:'), 0)
-        panel_toolbar.addWidget(self.control_panel_mode_combo, 1)
-        panel_toolbar.addWidget(self.quick_mode_label, 0)
-        panel_toolbar.addWidget(self.quick_mode_normal_btn, 0)
-        panel_toolbar.addWidget(self.quick_mode_dual_btn, 0)
-        panel_toolbar.addWidget(self.quick_view_overview_btn, 0)
-        panel_toolbar.addWidget(self.quick_view_live_btn, 0)
-        panel_toolbar.addWidget(self.quick_view_measure_btn, 0)
-        panel_toolbar.addStretch(1)
+            btn.setMinimumHeight(32)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setProperty('variant', 'chip')
+        for btn in [
+            self.model_config_button, self.choose_output_dir_btn, self.open_output_dir_btn,
+            self.export_runtime_log_btn, self.restore_layout_btn, self.event_log_toggle_btn,
+            self.event_log_clear_btn, self.control_panel_toggle_btn
+        ]:
+            btn.setCursor(Qt.PointingHandCursor)
+
+        self.header_title_label = QLabel('视觉检测仪智能测量工作台')
+        self.header_title_label.setObjectName('headerTitle')
+        self.header_subtitle_label = QLabel('普通相机优先 · 位姿激光融合 · 实际尺寸估计 · 现场采集闭环')
+        self.header_subtitle_label.setObjectName('headerSubtitle')
+        self.header_subtitle_label.setVisible(False)
+        self.header_title_label.setToolTip('普通相机优先 · 位姿激光融合 · 实际尺寸估计 · 现场采集闭环')
+        self.header_status_label = QLabel('系统就绪')
+        self.header_status_label.setObjectName('headerPill')
+        header_frame = QFrame()
+        header_frame.setObjectName('topHeader')
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(14, 6, 14, 6)
+        header_layout.setSpacing(10)
+        header_frame.setMaximumHeight(54)
+        header_text = QVBoxLayout()
+        header_text.setContentsMargins(0, 0, 0, 0)
+        header_text.setSpacing(2)
+        header_text.addWidget(self.header_title_label)
+        header_text.addWidget(self.header_subtitle_label)
+        header_layout.addLayout(header_text, 1)
+        header_layout.addWidget(self.header_status_label, 0, Qt.AlignRight | Qt.AlignVCenter)
+
+        toolbar_frame = QFrame()
+        toolbar_frame.setObjectName('modernToolbar')
+        toolbar_layout = QGridLayout(toolbar_frame)
+        toolbar_layout.setContentsMargins(10, 7, 10, 7)
+        toolbar_layout.setHorizontalSpacing(7)
+        toolbar_layout.setVerticalSpacing(5)
+        toolbar_frame.setMaximumHeight(78)
+        toolbar_layout.addWidget(self.model_config_button, 0, 0)
+        toolbar_layout.addWidget(self.choose_output_dir_btn, 0, 1)
+        toolbar_layout.addWidget(self.open_output_dir_btn, 0, 2)
+        toolbar_layout.addWidget(self.export_runtime_log_btn, 0, 3)
+        toolbar_layout.addWidget(self.restore_layout_btn, 0, 4)
+        toolbar_layout.addWidget(QLabel('工作区'), 0, 5)
+        toolbar_layout.addWidget(self.workspace_mode_combo, 0, 6)
+        toolbar_layout.addWidget(QLabel('设备面板'), 0, 7)
+        toolbar_layout.addWidget(self.control_panel_mode_combo, 0, 8)
+        toolbar_layout.addWidget(self.control_panel_toggle_btn, 0, 9)
+        toolbar_layout.addWidget(self.preview_mode_b_combo, 1, 0, 1, 2)
+        toolbar_layout.addWidget(self.preview_mode_a_combo, 1, 2, 1, 2)
+        toolbar_layout.addWidget(self.event_log_toggle_btn, 1, 4)
+        toolbar_layout.addWidget(self.event_log_clear_btn, 1, 5)
+        toolbar_layout.addWidget(self.quick_mode_label, 1, 6)
+        toolbar_layout.addWidget(self.quick_mode_normal_btn, 1, 7)
+        toolbar_layout.addWidget(self.quick_mode_dual_btn, 1, 8)
+        toolbar_layout.addWidget(self.quick_view_overview_btn, 1, 9)
+        toolbar_layout.addWidget(self.quick_view_live_btn, 1, 10)
+        toolbar_layout.addWidget(self.quick_view_measure_btn, 1, 11)
+        toolbar_layout.setColumnStretch(12, 1)
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
         right_scroll.setWidget(right_widget)
@@ -1181,8 +1340,9 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         main_layout = QVBoxLayout()
         main_layout.setSpacing(8)
         main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.addLayout(panel_toolbar)
-        main_layout.addWidget(self.config_summary_label)
+        main_layout.addWidget(header_frame)
+        main_layout.addWidget(toolbar_frame)
+        self.config_summary_label.setVisible(False)
         main_layout.addWidget(self.status_cards_container)
         main_layout.addWidget(self.event_log_group)
         main_layout.addWidget(root_splitter)
@@ -1231,6 +1391,8 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.setup_connections()
         self.setup_shortcuts()
         self.run_startup_self_check()
+        QTimer.singleShot(800, lambda: self.request_hardware_auto_detect(trigger='startup', auto_connect=True, force=False))
+        QTimer.singleShot(1200, lambda: self.update_camera_params_from_current_camera(auto=True, reason='startup'))
     def _wrap_scroll_page(self, widget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1303,6 +1465,966 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         model_layout.addStretch(1)
         model_widget.setLayout(model_layout)
         return model_widget
+    def build_hardware_control_group(self, panel_style=''):
+        group = QGroupBox('六轴 / 激光 / 三维采集')
+        if panel_style:
+            group.setStyleSheet(panel_style)
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 18, 12, 12)
+        port_row = QGridLayout()
+        port_row.setHorizontalSpacing(8)
+        port_row.setVerticalSpacing(8)
+        port_row.addWidget(QLabel('六轴串口'), 0, 0)
+        port_row.addWidget(self.hardware_imu_port_combo, 0, 1)
+        port_row.addWidget(QLabel('六轴波特率'), 0, 2)
+        port_row.addWidget(self.hardware_imu_baudrate_combo, 0, 3)
+        port_row.addWidget(self.hardware_imu_connect_btn, 0, 4)
+        port_row.addWidget(QLabel('激光串口'), 1, 0)
+        port_row.addWidget(self.hardware_laser_port_combo, 1, 1)
+        port_row.addWidget(QLabel('激光波特率'), 1, 2)
+        port_row.addWidget(self.hardware_laser_baudrate_combo, 1, 3)
+        port_row.addWidget(self.hardware_laser_connect_btn, 1, 4)
+        layout.addLayout(port_row)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addWidget(self.hardware_refresh_ports_btn)
+        action_row.addWidget(self.hardware_auto_detect_btn)
+        action_row.addWidget(self.hardware_serial_diag_btn)
+        action_row.addWidget(self.hardware_imu_zero_btn)
+        action_row.addWidget(self.hardware_new_session_btn)
+        action_row.addWidget(self.hardware_capture_btn)
+        layout.addLayout(action_row)
+        auto_row = QHBoxLayout()
+        auto_row.setSpacing(8)
+        auto_row.addWidget(QLabel('图像源'))
+        auto_row.addWidget(self.hardware_frame_source_combo, 1)
+        auto_row.addWidget(QLabel('自动间隔(s)'))
+        auto_row.addWidget(self.hardware_auto_interval_input)
+        auto_row.addWidget(self.hardware_auto_capture_btn)
+        auto_row.addWidget(self.hardware_clear_traj_btn)
+        layout.addLayout(auto_row)
+        camera_param_box = QFrame()
+        camera_param_box.setObjectName('cameraParamPanel')
+        camera_param_box.setStyleSheet('QFrame#cameraParamPanel {background:#ffffff; border:1px solid #e2e8f0; border-radius:12px;}')
+        camera_param_grid = QGridLayout(camera_param_box)
+        camera_param_grid.setContentsMargins(10, 8, 10, 8)
+        camera_param_grid.setHorizontalSpacing(8)
+        camera_param_grid.setVerticalSpacing(6)
+        camera_param_grid.addWidget(QLabel('相机参数源'), 0, 0)
+        camera_param_grid.addWidget(self.hardware_camera_param_source_combo, 0, 1)
+        camera_param_grid.addWidget(self.hardware_read_camera_params_btn, 0, 2)
+        camera_param_grid.addWidget(self.hardware_apply_geometry_btn, 0, 3)
+        camera_param_grid.addWidget(self.hardware_edit_camera_params_btn, 0, 4)
+        camera_param_grid.addWidget(QLabel('HFOV'), 1, 0)
+        camera_param_grid.addWidget(self.hardware_hfov_input, 1, 1)
+        camera_param_grid.addWidget(QLabel('VFOV'), 1, 2)
+        camera_param_grid.addWidget(self.hardware_vfov_input, 1, 3)
+        camera_param_grid.addWidget(self.hardware_camera_param_status_label, 2, 0, 1, 5)
+        camera_param_grid.setColumnStretch(1, 1)
+        camera_param_grid.setColumnStretch(3, 1)
+        layout.addWidget(camera_param_box)
+        status_box = QFrame()
+        status_box.setObjectName('hardwareStatusPanel')
+        status_box.setStyleSheet('QFrame#hardwareStatusPanel {background:#f8fbff; border:1px solid #dbeafe; border-radius:14px;}')
+        status_layout = QGridLayout()
+        status_layout.setContentsMargins(10, 8, 10, 8)
+        status_layout.setHorizontalSpacing(10)
+        status_layout.addWidget(self.hardware_pose_label, 0, 0, 2, 1)
+        status_layout.addWidget(self.hardware_distance_label, 0, 1)
+        status_layout.addWidget(self.hardware_frame_count_label, 1, 1)
+        status_layout.addWidget(self.hardware_imu_health_label, 2, 0)
+        status_layout.addWidget(self.hardware_laser_health_label, 2, 1)
+        status_layout.addWidget(self.hardware_detect_status_label, 3, 0, 1, 2)
+        status_layout.addWidget(self.hardware_geometry_label, 4, 0, 1, 2)
+        status_layout.addWidget(self.hardware_session_label, 5, 0, 1, 2)
+        status_layout.addWidget(self.hardware_link_status_label, 6, 0, 1, 2)
+        status_box.setLayout(status_layout)
+        layout.addWidget(status_box)
+        layout.addWidget(self.hardware_trajectory_widget, 1)
+        note = QLabel('说明：该模块自动识别六轴与激光串口，实时显示 XYZ(m)、RPY(°) 和激光距离(m/mm)，并基于视场角估计视距、焦距、单像素实际尺寸与裂缝实际宽度；采集时同步保存 JPG + pose_laser_index.csv。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color:#64748b; background:#f8fafc; border:1px dashed #cbd5e1; border-radius:10px; padding:8px 10px;')
+        layout.addWidget(note)
+        group.setLayout(layout)
+        return group
+
+    def build_hardware_config_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        hint = QLabel('位姿 / 硬件采集模块已经集成到右侧设备面板的“位姿激光采集”页。系统会自动识别六轴与激光串口，六轴换算为 XYZ/RPY，激光换算为距离，并结合相机视场角估计视距、焦距、mm/px 和裂缝实际尺寸；采集按钮把当前普通相机B、工业相机A或实时叠加帧与硬件数据同步保存。')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('padding:10px 12px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
+        table = QLabel('输出文件：\n• frame_xxxxxx.jpg：采集图像\n• pose_laser_index.csv：frame_id、timestamp、图像源、XYZ(m)、Roll/Pitch/Yaw(°)、原始位姿、激光距离(m/mm)、投影中心点、视距、焦距、mm/px、视场范围\n\n推荐流程：\n1. 打开普通相机B或工业相机A；\n2. 等待系统自动识别并连接六轴与激光；\n3. 点击“位姿归零”；\n4. 新建硬件会话；\n5. 手动或自动采集当前帧。')
+        table.setWordWrap(True)
+        table.setStyleSheet('padding:10px 12px; border:1px dashed #cbd5e1; border-radius:8px; background:#ffffff; color:#475569;')
+        layout.addWidget(hint)
+        layout.addWidget(table)
+        layout.addStretch(1)
+        page.setLayout(layout)
+        return self._wrap_scroll_page(page)
+
+    def _choose_hardware_default_ports(self, ports, current_imu='', current_laser=''):
+        ports = list(ports or [])
+        port_set = {p.upper(): p for p in ports}
+        current_imu = str(current_imu or '').strip()
+        current_laser = str(current_laser or '').strip()
+        detected = getattr(self, 'hardware_last_detection_result', {}) or {}
+        detected_imu = str(detected.get('imu_port') or '').strip()
+        detected_laser = str(detected.get('laser_port') or '').strip()
+
+        def valid(port):
+            return bool(port) and (not ports or port.upper() in port_set)
+
+        imu = detected_imu if valid(detected_imu) else (current_imu if valid(current_imu) else '')
+        laser = detected_laser if valid(detected_laser) else (current_laser if valid(current_laser) else '')
+        if imu and laser and imu.upper() == laser.upper():
+            # Prefer detected roles over stale saved config.
+            if detected_imu and detected_laser and detected_imu.upper() != detected_laser.upper():
+                imu, laser = detected_imu, detected_laser
+            else:
+                laser = ''
+        if not imu and ports:
+            imu = ports[0]
+        if not laser and ports:
+            for p in ports:
+                if p.upper() != str(imu).upper():
+                    laser = p
+                    break
+        return imu, laser
+
+    def _hardware_worker_running(self, name):
+        worker = getattr(self, name, None)
+        return worker is not None and worker.isRunning()
+
+    def request_hardware_auto_detect(self, trigger='startup', auto_connect=True, force=False):
+        """Detect COM roles and optionally connect both hardware streams."""
+        try:
+            if getattr(self, '_app_closing', False):
+                return
+        except Exception:
+            pass
+        detector = getattr(self, 'hardware_autodetect_thread', None)
+        if detector is not None and detector.isRunning():
+            if hasattr(self, 'hardware_detect_status_label'):
+                self.hardware_detect_status_label.setText('自动识别：正在进行，请稍候...')
+            return
+        if (self._hardware_worker_running('hardware_imu_thread') and self._hardware_worker_running('hardware_laser_thread')) and not force:
+            if hasattr(self, 'hardware_detect_status_label'):
+                self.hardware_detect_status_label.setText('自动识别：六轴与激光已在线，无需重复识别。')
+            return
+        ports = serial_port_names()
+        self.refresh_hardware_ports(initial=True)
+        if not ports:
+            msg = '自动识别：未发现 COM 串口。请检查 USB 连接、设备供电和驱动。'
+            self.hardware_detect_status_label.setText(msg)
+            self.hardware_link_status_label.setText('硬件状态：' + msg)
+            self.append_runtime_event(msg, level='warn')
+            return
+        self.hardware_detect_status_label.setText(f'自动识别：正在扫描 {", ".join(ports)} ...')
+        self.hardware_link_status_label.setText('硬件状态：正在自动识别六轴与激光串口...')
+        self.hardware_auto_detect_btn.setEnabled(False)
+        detector = HardwareAutoDetectThread(ports=ports, parent=self)
+        detector.progress_changed.connect(self._on_hardware_autodetect_progress)
+        detector.result_ready.connect(lambda result, auto_connect=auto_connect, trigger=trigger: self._on_hardware_autodetect_result(result, auto_connect=auto_connect, trigger=trigger))
+        self.hardware_autodetect_thread = detector
+        detector.start()
+
+    def _on_hardware_autodetect_progress(self, message):
+        text = f'自动识别：{message}'
+        if hasattr(self, 'hardware_detect_status_label'):
+            self.hardware_detect_status_label.setText(text)
+        self.hardware_link_status_label.setText('硬件状态：' + text)
+
+    def _on_hardware_autodetect_result(self, result, auto_connect=True, trigger='startup'):
+        self.hardware_last_detection_result = dict(result or {})
+        try:
+            self.hardware_auto_detect_btn.setEnabled(True)
+        except Exception:
+            pass
+        summary = str(self.hardware_last_detection_result.get('summary') or '识别完成。')
+        self.hardware_detect_status_label.setText('自动识别：' + summary)
+        self.hardware_link_status_label.setText('硬件状态：' + summary)
+        self.append_runtime_event(f'硬件自动识别完成：{summary}', level='ok' if ('未识别' not in summary) else 'warn')
+
+        imu_port = str(self.hardware_last_detection_result.get('imu_port') or '').strip()
+        laser_port = str(self.hardware_last_detection_result.get('laser_port') or '').strip()
+        ports = list(self.hardware_last_detection_result.get('ports') or serial_port_names())
+
+        def refill_combo(combo, selected):
+            combo.blockSignals(True)
+            old = combo.currentText().strip()
+            combo.clear()
+            if ports:
+                combo.addItems(ports)
+            elif selected:
+                combo.addItem(selected)
+            else:
+                combo.addItem('未发现串口')
+            if selected:
+                combo.setCurrentText(selected)
+            elif old:
+                combo.setCurrentText(old)
+            combo.blockSignals(False)
+
+        if imu_port:
+            refill_combo(self.hardware_imu_port_combo, imu_port)
+            self.config.hardware_imu_port = imu_port
+            self.hardware_imu_health_label.setText(f'六轴：已识别 {imu_port} @ {self.hardware_imu_baudrate_combo.currentText()}')
+        else:
+            self.hardware_imu_health_label.setText('六轴：未识别，请查看诊断报告')
+        if laser_port:
+            refill_combo(self.hardware_laser_port_combo, laser_port)
+            self.config.hardware_laser_stream_port = laser_port
+            lp = self.hardware_last_detection_result.get('laser_probe') or {}
+            dist = lp.get('distance_m')
+            if dist is not None:
+                self.hardware_laser_health_label.setText(f'激光：已识别 {laser_port}，当前 {float(dist):.3f} m')
+                self.hardware_distance_label.setText(f'激光距离：{float(dist):.3f} m / {float(dist) * 1000.0:.1f} mm')
+            else:
+                self.hardware_laser_health_label.setText(f'激光：已识别 {laser_port}')
+        else:
+            self.hardware_laser_health_label.setText('激光：未识别，请查看诊断报告')
+        self.save_system_config()
+
+        if auto_connect:
+            if imu_port and not self._hardware_worker_running('hardware_imu_thread'):
+                QTimer.singleShot(30, lambda: self.toggle_hardware_imu(auto=True))
+            if laser_port and not self._hardware_worker_running('hardware_laser_thread'):
+                QTimer.singleShot(180, lambda: self.toggle_hardware_laser_stream(auto=True))
+
+    def ensure_hardware_auto_connected(self, trigger='camera_open'):
+        if bool(getattr(self.config, 'hardware_camera_params_auto_read', True)):
+            try:
+                QTimer.singleShot(260, lambda: self.update_camera_params_from_current_camera(auto=True, reason=trigger))
+            except Exception:
+                pass
+        if self._hardware_worker_running('hardware_imu_thread') and self._hardware_worker_running('hardware_laser_thread'):
+            return
+        self.request_hardware_auto_detect(trigger=trigger, auto_connect=True, force=False)
+
+    def refresh_hardware_ports(self, initial=False):
+        ports = serial_port_names()
+        current_imu = str(getattr(self.config, 'hardware_imu_port', '') or '')
+        current_laser = str(getattr(self.config, 'hardware_laser_stream_port', '') or '')
+        imu_default, laser_default = self._choose_hardware_default_ports(ports, current_imu, current_laser)
+        for combo, current in [(self.hardware_imu_port_combo, imu_default), (self.hardware_laser_port_combo, laser_default)]:
+            combo.blockSignals(True)
+            combo.clear()
+            if ports:
+                combo.addItems(ports)
+            else:
+                combo.addItem('未发现串口')
+            if current:
+                combo.setCurrentText(current)
+            combo.blockSignals(False)
+        if ports:
+            msg = f'硬件串口列表已刷新：{", ".join(ports)}。当前六轴={self.hardware_imu_port_combo.currentText()}，激光={self.hardware_laser_port_combo.currentText()}。'
+            if self.hardware_imu_port_combo.currentText() == self.hardware_laser_port_combo.currentText():
+                msg += ' 注意：两个设备当前选择了同一个串口，通常会导致其中一个读不到数据。'
+        else:
+            msg = '未发现串口。请检查 USB 转串口驱动、线缆、设备供电，并确认设备管理器中有 COM 口。'
+        self.hardware_link_status_label.setText('硬件状态：' + msg)
+        if not initial:
+            self.append_runtime_event(msg, level='info')
+
+    def show_hardware_serial_diagnostics(self):
+        details = serial_port_details()
+        detection = getattr(self, 'hardware_last_detection_result', {}) or {}
+        probes = detection.get('probes') or {}
+        dialog = QDialog(self)
+        dialog.setWindowTitle('硬件连接诊断')
+        dialog.resize(980, 620)
+        root = QVBoxLayout()
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        title = QLabel('硬件连接诊断')
+        title.setStyleSheet('font-size:18px; font-weight:700; color:#0f172a;')
+        root.addWidget(title)
+        summary = QLabel(
+            f"当前选择：六轴={self.hardware_imu_port_combo.currentText()} @ {self.hardware_imu_baudrate_combo.currentText()}，"
+            f"激光={self.hardware_laser_port_combo.currentText()} @ {self.hardware_laser_baudrate_combo.currentText()}\n"
+            f"自动识别结果：{detection.get('summary', '尚未执行自动识别')}"
+        )
+        summary.setWordWrap(True)
+        summary.setStyleSheet('padding:10px 12px; border:1px solid #d8e3f0; border-radius:8px; background:#f8fbff; color:#334155;')
+        root.addWidget(summary)
+
+        table = QTableWidget()
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels(['COM', '系统描述', '制造商', '硬件ID', '激光识别', '六轴识别', '建议'])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        ports_in_details = [d.get('device', '') for d in details]
+        all_ports = ports_in_details or serial_port_names()
+        if not details and all_ports:
+            details = [{'device': p, 'description': '', 'manufacturer': '', 'hwid': ''} for p in all_ports]
+        table.setRowCount(max(1, len(details)))
+        if not details:
+            table.setItem(0, 0, QTableWidgetItem('未发现'))
+            table.setItem(0, 6, QTableWidgetItem('检查 USB 连接、供电、驱动和设备管理器'))
+        else:
+            for row, item in enumerate(details):
+                port = str(item.get('device', '') or '')
+                port_probe = probes.get(port, {}) if isinstance(probes, dict) else {}
+                laser = port_probe.get('laser') or {}
+                imu = port_probe.get('imu') or {}
+                laser_text = laser.get('message', '未测试')
+                imu_text = imu.get('message', '未测试')
+                advice = []
+                if port == detection.get('laser_port'):
+                    advice.append('作为激光使用')
+                if port == detection.get('imu_port'):
+                    advice.append('作为六轴使用')
+                if '无法打开' in str(laser_text) or '无法打开' in str(imu_text):
+                    advice.append('端口可能被占用')
+                if not advice:
+                    advice.append('非目标设备或需重新识别')
+                values = [
+                    port,
+                    str(item.get('description', '') or ''),
+                    str(item.get('manufacturer', '') or ''),
+                    str(item.get('hwid', '') or ''),
+                    str(laser_text),
+                    str(imu_text),
+                    '；'.join(advice),
+                ]
+                for col, value in enumerate(values):
+                    table.setItem(row, col, QTableWidgetItem(value))
+        try:
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+            table.horizontalHeader().setStretchLastSection(True)
+        except Exception:
+            pass
+        root.addWidget(table, 1)
+
+        report = QTextEdit()
+        report.setReadOnly(True)
+        report.setMinimumHeight(130)
+        report.setStyleSheet('background:#0f172a; color:#e2e8f0; border:1px solid #1e293b; border-radius:8px; padding:8px; font-family:Consolas, Microsoft YaHei UI, monospace; font-size:12px;')
+        report_lines = []
+        report_lines.append('[Hardware Diagnostic Report]')
+        report_lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report_lines.append(f"Selected IMU: {self.hardware_imu_port_combo.currentText()} @ {self.hardware_imu_baudrate_combo.currentText()}")
+        report_lines.append(f"Selected Laser: {self.hardware_laser_port_combo.currentText()} @ {self.hardware_laser_baudrate_combo.currentText()}")
+        report_lines.append(f"Detected: {detection.get('summary', 'N/A')}")
+        report_lines.append(f"IMU running: {self._hardware_worker_running('hardware_imu_thread')}")
+        report_lines.append(f"Laser running: {self._hardware_worker_running('hardware_laser_thread')}")
+        report_lines.append('')
+        report_lines.append('Suggestions:')
+        if self.hardware_imu_port_combo.currentText().strip() == self.hardware_laser_port_combo.currentText().strip():
+            report_lines.append('- 六轴和激光不能使用同一个 COM 口。')
+        report_lines.append('- 识别结果以有效协议帧为准，不再按固定 COM 号猜测。')
+        report_lines.append('- 若“无法打开”，通常是串口助手、厂商软件或旧程序占用了端口。')
+        report_lines.append('- 若“有输入但无法解析”，请检查设备是否插错端口、波特率是否被设备管理器改写、设备供电是否稳定。')
+        report_lines.append('')
+        report_lines.append('Raw probes:')
+        try:
+            report_lines.append(json.dumps(probes, ensure_ascii=False, indent=2, default=str))
+        except Exception:
+            report_lines.append(str(probes))
+        report.setPlainText('\n'.join(report_lines))
+        root.addWidget(report)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        detect_btn = QPushButton('重新识别并连接')
+        copy_btn = QPushButton('复制报告')
+        close_btn = QPushButton('关闭')
+        detect_btn.clicked.connect(lambda: (dialog.close(), self.request_hardware_auto_detect(trigger='diagnostic', auto_connect=True, force=True)))
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(report.toPlainText()))
+        close_btn.clicked.connect(dialog.close)
+        btn_row.addWidget(detect_btn)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+        dialog.setLayout(root)
+        self.hardware_link_status_label.setText('硬件状态：已打开诊断窗口。')
+        dialog.exec()
+
+    def _hardware_ports_conflict(self, target=''):
+        imu_port = self.hardware_imu_port_combo.currentText().strip()
+        laser_port = self.hardware_laser_port_combo.currentText().strip()
+        if not imu_port or not laser_port or imu_port == '未发现串口' or laser_port == '未发现串口':
+            return False
+        if imu_port != laser_port:
+            return False
+        msg = '六轴和激光当前选择了同一个串口。串口一般不能被两个线程同时打开，这会直接导致六轴或激光读不到数据。请把六轴和激光分别选到两个不同 COM 口，或点击“自动识别并连接”。'
+        self.hardware_link_status_label.setText('硬件状态：' + msg)
+        QMessageBox.warning(self, '串口冲突', msg)
+        self.append_runtime_event(msg, level='error')
+        return True
+
+    def _on_hardware_worker_status(self, kind, msg):
+        self.hardware_link_status_label.setText(f'硬件状态：{kind}：{msg}')
+        if kind in ('IMU', '六轴') and hasattr(self, 'hardware_imu_health_label'):
+            self.hardware_imu_health_label.setText(f'六轴：{msg}')
+        elif kind == '激光' and hasattr(self, 'hardware_laser_health_label'):
+            self.hardware_laser_health_label.setText(f'激光：{msg}')
+        self.append_runtime_event(msg, level='info')
+
+    def _on_hardware_worker_debug(self, kind, msg):
+        self.hardware_link_status_label.setText(f'硬件状态：{kind}：{msg}')
+        if kind in ('IMU', '六轴') and hasattr(self, 'hardware_imu_health_label'):
+            self.hardware_imu_health_label.setText(f'六轴：{msg}')
+        elif kind == '激光' and hasattr(self, 'hardware_laser_health_label'):
+            self.hardware_laser_health_label.setText(f'激光：{msg}')
+        self.append_runtime_event(f'{kind}诊断：{msg}', level='info')
+
+    def _on_hardware_worker_error(self, kind, msg):
+        self.hardware_link_status_label.setText(f'硬件状态：{kind}错误：{msg}')
+        self.append_runtime_event(msg, level='error')
+        if kind in ('IMU', '六轴'):
+            self.hardware_imu_connect_btn.setText('连接六轴')
+            if hasattr(self, 'hardware_imu_health_label'):
+                self.hardware_imu_health_label.setText(f'六轴：连接失败 - {msg}')
+            self.hardware_imu_thread = None
+        elif kind == '激光':
+            self.hardware_laser_connect_btn.setText('连接激光')
+            if hasattr(self, 'hardware_laser_health_label'):
+                self.hardware_laser_health_label.setText(f'激光：连接失败 - {msg}')
+            self.hardware_laser_thread = None
+
+    def on_hardware_imu_baudrate_changed(self, text):
+        try:
+            self.config.hardware_imu_baudrate = int(float(text))
+            self.save_system_config()
+        except Exception:
+            pass
+
+    def on_hardware_laser_baudrate_changed(self, text):
+        try:
+            self.config.hardware_laser_stream_baudrate = int(float(text))
+            self.save_system_config()
+        except Exception:
+            pass
+
+    def on_hardware_frame_source_changed(self, text):
+        mapping = {'自动': 'auto', '普通相机B': 'camera_b', '工业相机A': 'camera_a', '实时叠加': 'main'}
+        self.config.hardware_capture_frame_source = mapping.get(text, 'auto')
+        self.save_system_config()
+
+    def toggle_hardware_imu(self, auto=False):
+        worker = getattr(self, 'hardware_imu_thread', None)
+        if worker is not None and worker.isRunning():
+            worker.stop_thread()
+            self.hardware_imu_thread = None
+            self.hardware_imu_connect_btn.setText('连接六轴')
+            self.append_runtime_event('六轴已断开。', level='info')
+            return
+        port = self.hardware_imu_port_combo.currentText().strip()
+        if not port or port == '未发现串口':
+            if not auto:
+                QMessageBox.warning(self, '提示', '当前没有可用六轴串口。')
+            return
+        other = getattr(self, 'hardware_laser_thread', None)
+        if other is not None and other.isRunning() and port == self.hardware_laser_port_combo.currentText().strip():
+            self._hardware_ports_conflict('IMU')
+            return
+        try:
+            baudrate = int(float(self.hardware_imu_baudrate_combo.currentText()))
+        except Exception:
+            baudrate = int(getattr(self.config, 'hardware_imu_baudrate', 115200))
+        self.config.hardware_imu_port = port
+        self.config.hardware_imu_baudrate = baudrate
+        self.save_system_config()
+        worker = IMUThread(port=port, baudrate=baudrate, parent=self)
+        worker.data_received.connect(self.on_hardware_imu_data)
+        worker.error_occurred.connect(lambda msg: self._on_hardware_worker_error('六轴', msg))
+        worker.status_changed.connect(lambda msg: self._on_hardware_worker_status('六轴', msg))
+        worker.debug_changed.connect(lambda msg: self._on_hardware_worker_debug('六轴', msg))
+        self.hardware_imu_thread = worker
+        worker.start_thread()
+        self.hardware_imu_connect_btn.setText('断开六轴')
+        self.hardware_link_status_label.setText(f'硬件状态：正在连接六轴 {port} @ {baudrate} ...')
+
+    def toggle_hardware_laser_stream(self, auto=False):
+        worker = getattr(self, 'hardware_laser_thread', None)
+        if worker is not None and worker.isRunning():
+            worker.stop_thread()
+            self.hardware_laser_thread = None
+            self.hardware_laser_connect_btn.setText('连接激光')
+            self.append_runtime_event('激光已断开。', level='info')
+            return
+        port = self.hardware_laser_port_combo.currentText().strip()
+        if not port or port == '未发现串口':
+            if not auto:
+                QMessageBox.warning(self, '提示', '当前没有可用激光串口。')
+            return
+        other = getattr(self, 'hardware_imu_thread', None)
+        if other is not None and other.isRunning() and port == self.hardware_imu_port_combo.currentText().strip():
+            self._hardware_ports_conflict('激光')
+            return
+        try:
+            baudrate = int(float(self.hardware_laser_baudrate_combo.currentText()))
+        except Exception:
+            baudrate = int(getattr(self.config, 'hardware_laser_stream_baudrate', 230400))
+        self.config.hardware_laser_stream_port = port
+        self.config.hardware_laser_stream_baudrate = baudrate
+        self.save_system_config()
+        worker = LaserBinaryThread(
+            port=port,
+            baudrate=baudrate,
+            frame_size=int(getattr(self.config, 'hardware_laser_frame_size', 195)),
+            header_byte=int(getattr(self.config, 'hardware_laser_header_byte', 170)),
+            parent=self,
+        )
+        worker.data_received.connect(self.on_hardware_laser_data)
+        worker.error_occurred.connect(lambda msg: self._on_hardware_worker_error('激光', msg))
+        worker.status_changed.connect(lambda msg: self._on_hardware_worker_status('激光', msg))
+        worker.debug_changed.connect(lambda msg: self._on_hardware_worker_debug('激光', msg))
+        self.hardware_laser_thread = worker
+        worker.start_thread()
+        self.hardware_laser_connect_btn.setText('断开激光')
+        self.hardware_link_status_label.setText(f'硬件状态：正在连接激光 {port} @ {baudrate} ...')
+
+    def reset_hardware_imu_zero(self):
+        worker = getattr(self, 'hardware_imu_thread', None)
+        if worker is not None:
+            worker.reset_zero()
+            self.append_runtime_event('六轴位姿已归零。', level='ok')
+        else:
+            self.hardware_pose_data.update({
+                'x': 0.0, 'y': 0.0, 'z': 0.0, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+                'raw_x': 0.0, 'raw_y': 0.0, 'raw_z': 0.0, 'raw_roll': 0.0, 'raw_pitch': 0.0, 'raw_yaw': 0.0,
+            })
+            self.on_hardware_imu_data(self.hardware_pose_data)
+
+    def _get_hardware_geometry_frame_shape(self):
+        """Return the most relevant frame shape for view-distance and size estimation."""
+        try:
+            source, frame = self._select_hardware_capture_frame()
+            if isinstance(frame, np.ndarray) and frame.size > 0:
+                return frame.shape, source
+        except Exception:
+            pass
+        for source, frame in [
+            ('camera_b', getattr(self, 'frame_b', None)),
+            ('camera_a', getattr(self, 'frame_a', None)),
+            ('main', self.latest_display_images.get('main') if hasattr(self, 'latest_display_images') else None),
+        ]:
+            if isinstance(frame, np.ndarray) and frame.size > 0:
+                return frame.shape, source
+        return None, ''
+
+    def _get_hardware_geometry_distance_m(self):
+        distance_m = float(getattr(self, 'hardware_distance_m', 0.0) or 0.0)
+        if distance_m <= 0 and getattr(self, 'last_laser_distance_mm', None):
+            distance_m = float(self.last_laser_distance_mm) / 1000.0
+        return distance_m
+
+    def _camera_param_source_key(self):
+        mapping = {'自动当前帧': 'auto', '普通相机B': 'camera_b', '工业相机A': 'camera_a', '实时叠加': 'main'}
+        combo = getattr(self, 'hardware_camera_param_source_combo', None)
+        text = combo.currentText() if combo is not None else '自动当前帧'
+        return mapping.get(text, 'auto')
+
+    def _format_fourcc(self, value):
+        try:
+            code = int(value or 0)
+            if code <= 0:
+                return ''
+            chars = ''.join(chr((code >> 8 * i) & 0xFF) for i in range(4))
+            return ''.join(ch for ch in chars if ch.isprintable()).strip()
+        except Exception:
+            return ''
+
+    def _read_cv_capture_properties(self, source):
+        """Read properties that OpenCV drivers actually expose for the active camera."""
+        cap = None
+        if source == 'camera_b':
+            try:
+                lock = getattr(self, 'camera_b_lock', None)
+                if lock is not None:
+                    with lock:
+                        cap = getattr(self, 'camera_b', None)
+                else:
+                    cap = getattr(self, 'camera_b', None)
+            except Exception:
+                cap = getattr(self, 'camera_b', None)
+        # Industrial camera SDK usually does not expose a cv2.VideoCapture object here.
+        if cap is None:
+            return {}
+        props = {}
+        try:
+            if not cap.isOpened():
+                return {}
+        except Exception:
+            return {}
+        cv_props = {
+            'width_px': cv2.CAP_PROP_FRAME_WIDTH,
+            'height_px': cv2.CAP_PROP_FRAME_HEIGHT,
+            'fps': cv2.CAP_PROP_FPS,
+            'exposure': cv2.CAP_PROP_EXPOSURE,
+            'focus': getattr(cv2, 'CAP_PROP_FOCUS', 28),
+            'zoom': getattr(cv2, 'CAP_PROP_ZOOM', 27),
+            'fourcc_raw': cv2.CAP_PROP_FOURCC,
+            'brightness': cv2.CAP_PROP_BRIGHTNESS,
+            'contrast': cv2.CAP_PROP_CONTRAST,
+        }
+        for key, prop in cv_props.items():
+            try:
+                val = cap.get(prop)
+                if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                    props[key] = float(val)
+            except Exception:
+                pass
+        if props.get('fourcc_raw'):
+            props['fourcc'] = self._format_fourcc(props.get('fourcc_raw'))
+        return props
+
+    def _select_frame_for_camera_params(self, source_key):
+        candidates = []
+        if source_key == 'camera_b':
+            candidates = [('camera_b', getattr(self, 'frame_b', None))]
+        elif source_key == 'camera_a':
+            frame_a_param = getattr(self, 'frame_a', None)
+            if not isinstance(frame_a_param, np.ndarray) or frame_a_param.size <= 0:
+                frame_a_param = getattr(self, 'frame_a_capture', None)
+            candidates = [('camera_a', frame_a_param)]
+        elif source_key == 'main':
+            candidates = [('main', self.latest_display_images.get('main') if hasattr(self, 'latest_display_images') else None)]
+        else:
+            frame_a_param = getattr(self, 'frame_a', None)
+            if not isinstance(frame_a_param, np.ndarray) or frame_a_param.size <= 0:
+                frame_a_param = getattr(self, 'frame_a_capture', None)
+            candidates = [
+                ('camera_b', getattr(self, 'frame_b', None)),
+                ('camera_a', frame_a_param),
+                ('main', self.latest_display_images.get('main') if hasattr(self, 'latest_display_images') else None),
+            ]
+        for source, frame in candidates:
+            if isinstance(frame, np.ndarray) and frame.size > 0 and len(frame.shape) >= 2:
+                return source, frame
+        return '', None
+
+    def update_camera_params_from_current_camera(self, auto=False, reason='manual'):
+        """Read current camera/frame properties and update FOV/intrinsics used by geometry estimation.
+
+        Most USB/industrial cameras do not expose true lens FOV through the driver. This method
+        therefore reads every reliable runtime property first, then derives FOV from calibration
+        and laser distance when available; otherwise it keeps the previous device default and marks
+        the estimate as a fallback.
+        """
+        source_key = self._camera_param_source_key()
+        source, frame = self._select_frame_for_camera_params(source_key)
+        if not source or frame is None:
+            msg = '相机参数：尚未获取到有效图像帧，打开普通相机或工业相机后会自动读取。'
+            if hasattr(self, 'hardware_camera_param_status_label'):
+                self.hardware_camera_param_status_label.setText(msg)
+            if not auto:
+                QMessageBox.information(self, '提示', msg)
+            return None
+        h, w = int(frame.shape[0]), int(frame.shape[1])
+        props = self._read_cv_capture_properties(source)
+        # Prefer actual frame size because many drivers report stale requested resolution.
+        if w > 0:
+            props['frame_width_px'] = float(w)
+        if h > 0:
+            props['frame_height_px'] = float(h)
+        distance_m = self._get_hardware_geometry_distance_m() if hasattr(self, '_get_hardware_geometry_distance_m') else 0.0
+        hfov = float(getattr(self.config, 'camera_horizontal_fov_deg', 60.0) or 60.0)
+        vfov = float(getattr(self.config, 'camera_vertical_fov_deg', 40.0) or 40.0)
+        source_note = '沿用当前设备默认视场角'
+        confidence = '中低'
+        try:
+            mpp = float(getattr(self, 'mm_per_pixel', 0.0) or 0.0)
+        except Exception:
+            mpp = 0.0
+        if mpp > 0 and distance_m > 0 and w > 0 and h > 0:
+            # Use the existing calibration scale plus the current laser distance to back-calculate the visible FOV.
+            scene_w_mm = mpp * float(w)
+            scene_h_mm = mpp * float(h)
+            distance_mm = distance_m * 1000.0
+            if distance_mm > 1e-6:
+                hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                vfov_calc = math.degrees(2.0 * math.atan(scene_h_mm / (2.0 * distance_mm)))
+                if 1.0 < hfov_calc < 178.0 and 1.0 < vfov_calc < 178.0:
+                    hfov, vfov = hfov_calc, vfov_calc
+                    source_note = '由当前标定比例 + 激光距离反推视场角'
+                    confidence = '高'
+        elif w > 0 and h > 0:
+            # When only horizontal FOV is known, update VFOV consistently from aspect ratio.
+            try:
+                vfov = math.degrees(2.0 * math.atan((h / max(w, 1.0)) * math.tan(math.radians(hfov / 2.0))))
+                source_note = '已读取分辨率，视场角采用上次设备默认值并按宽高比修正'
+            except Exception:
+                pass
+        self.config.camera_horizontal_fov_deg = float(hfov)
+        self.config.camera_vertical_fov_deg = float(vfov)
+        self.config.hardware_camera_param_source = source_key
+        self.save_system_config()
+        try:
+            self.hardware_hfov_input.setText(f'{hfov:.2f}')
+            self.hardware_vfov_input.setText(f'{vfov:.2f}')
+            if hasattr(self, 'laser_hfov_input'):
+                self.laser_hfov_input.setText(f'{hfov:.2f}')
+        except Exception:
+            pass
+        details = []
+        if props.get('fps', 0) > 0:
+            details.append(f"FPS={props.get('fps'):.1f}")
+        if props.get('fourcc'):
+            details.append(f"编码={props.get('fourcc')}")
+        if props.get('exposure', 0) not in (0, -1):
+            details.append(f"曝光={props.get('exposure'):.2f}")
+        if props.get('focus', 0) not in (0, -1):
+            details.append(f"焦点={props.get('focus'):.2f}")
+        if props.get('zoom', 0) not in (0, -1):
+            details.append(f"变焦={props.get('zoom'):.2f}")
+        status = f"相机参数：{source} | {w}×{h}px | HFOV={hfov:.2f}°，VFOV={vfov:.2f}° | {source_note} | 置信度={confidence}"
+        if details:
+            status += ' | ' + '，'.join(details[:4])
+        if hasattr(self, 'hardware_camera_param_status_label'):
+            self.hardware_camera_param_status_label.setText(status)
+        if not auto:
+            self.append_runtime_event(status, level='ok')
+        self.update_hardware_geometry_estimate(reason='camera_params')
+        return {'source': source, 'width_px': w, 'height_px': h, 'hfov_deg': hfov, 'vfov_deg': vfov, 'props': props, 'note': source_note, 'confidence': confidence}
+
+    def toggle_hardware_camera_param_manual_edit(self):
+        enabled = not bool(getattr(self.config, 'hardware_camera_params_manual_edit', False))
+        self.config.hardware_camera_params_manual_edit = enabled
+        self.save_system_config()
+        for edit in [getattr(self, 'hardware_hfov_input', None), getattr(self, 'hardware_vfov_input', None)]:
+            if edit is not None:
+                edit.setReadOnly(not enabled)
+        if hasattr(self, 'hardware_edit_camera_params_btn'):
+            self.hardware_edit_camera_params_btn.setText('锁定参数' if enabled else '手动修正')
+        msg = '相机视场角已解锁，可手动修正。' if enabled else '相机视场角已锁定，优先使用自动读取/标定结果。'
+        if hasattr(self, 'hardware_camera_param_status_label'):
+            self.hardware_camera_param_status_label.setText('相机参数：' + msg)
+        self.append_runtime_event(msg, level='info')
+
+    def apply_hardware_camera_geometry(self):
+        """Apply user-edited camera FOV parameters and refresh the geometry estimate."""
+        try:
+            hfov = float(self.hardware_hfov_input.text().strip() or self.config.camera_horizontal_fov_deg)
+            vfov = float(self.hardware_vfov_input.text().strip() or self.config.camera_vertical_fov_deg)
+            if not (1.0 < hfov < 178.0):
+                raise ValueError('水平FOV应在 1~178° 之间')
+            if not (1.0 < vfov < 178.0):
+                raise ValueError('垂直FOV应在 1~178° 之间')
+            self.config.camera_horizontal_fov_deg = hfov
+            self.config.camera_vertical_fov_deg = vfov
+            if hasattr(self, 'laser_hfov_input'):
+                self.laser_hfov_input.setText(f'{hfov:.2f}')
+            self.save_system_config()
+            self.update_hardware_geometry_estimate(reason='manual')
+            self.append_runtime_event(f'相机参数已更新：HFOV={hfov:.2f}°，VFOV={vfov:.2f}°。', level='ok')
+        except Exception as exc:
+            QMessageBox.warning(self, '参数无效', f'相机视场角参数无效：{exc}')
+
+    def update_hardware_geometry_estimate(self, reason='auto'):
+        """Estimate view distance, intrinsic parameters, and physical scale."""
+        if not hasattr(self, 'hardware_geometry_label'):
+            return None
+        frame_shape, source = self._get_hardware_geometry_frame_shape()
+        distance_m = self._get_hardware_geometry_distance_m()
+        if frame_shape is None:
+            self.hardware_geometry_label.setText('尺寸估算：等待普通相机或工业相机图像帧')
+            return None
+        if distance_m <= 0:
+            self.hardware_geometry_label.setText('尺寸估算：等待有效激光距离')
+            return None
+        try:
+            hfov = float(self.hardware_hfov_input.text().strip() or self.config.camera_horizontal_fov_deg)
+        except Exception:
+            hfov = float(getattr(self.config, 'camera_horizontal_fov_deg', 60.0))
+        try:
+            vfov = float(self.hardware_vfov_input.text().strip() or self.config.camera_vertical_fov_deg)
+        except Exception:
+            vfov = float(getattr(self.config, 'camera_vertical_fov_deg', 40.0))
+        estimate = estimate_camera_geometry_from_pose(
+            frame_shape=frame_shape,
+            distance_m=distance_m,
+            sensor_data=getattr(self, 'hardware_pose_data', {}) or {},
+            hfov_deg=hfov,
+            vfov_deg=vfov,
+        )
+        self.hardware_geometry_estimate = estimate
+        if not estimate.get('ok'):
+            self.hardware_geometry_label.setText('尺寸估算：' + str(estimate.get('message') or '估计失败'))
+            return estimate
+        text = (
+            f"尺寸估算：{source or '当前图像'} | 视距={estimate['view_distance_m']:.3f} m，"
+            f"姿态修正距离≈{estimate['normal_distance_m']:.3f} m，倾角≈{estimate['tilt_deg']:.1f}°，置信度={estimate['confidence']}\n"
+            f"相机参数：fx={estimate['fx_px']:.1f}px，fy={estimate['fy_px']:.1f}px，"
+            f"HFOV={estimate['hfov_deg']:.1f}°，VFOV={estimate['vfov_deg']:.1f}°\n"
+            f"实际比例：X={estimate['mm_per_px_x']:.4f} mm/px，Y={estimate['mm_per_px_y']:.4f} mm/px，"
+            f"视场≈{estimate['scene_width_mm']:.1f}×{estimate['scene_height_mm']:.1f} mm"
+        )
+        self.hardware_geometry_label.setText(text)
+        try:
+            self.latest_estimated_mm_per_pixel = float(estimate.get('mm_per_px_avg') or 0.0)
+            self.current_measurement_source = '激光+六轴+相机参数估算'
+        except Exception:
+            pass
+        return estimate
+
+    def on_hardware_imu_data(self, data):
+        self.hardware_pose_data = dict(data or {})
+        pose_text = (
+            f"位置XYZ：{self.hardware_pose_data.get('x', 0.0):.3f} / {self.hardware_pose_data.get('y', 0.0):.3f} / {self.hardware_pose_data.get('z', 0.0):.3f} m\n"
+            f"姿态RPY：{self.hardware_pose_data.get('roll', 0.0):.2f} / {self.hardware_pose_data.get('pitch', 0.0):.2f} / {self.hardware_pose_data.get('yaw', 0.0):.2f} °"
+        )
+        self.hardware_pose_label.setText(pose_text)
+        if hasattr(self, 'hardware_imu_health_label'):
+            self.hardware_imu_health_label.setText('六轴：在线，' + pose_text.replace('位置XYZ：', 'XYZ=').replace('姿态RPY：', 'RPY=').replace('\n', '；'))
+        self.update_hardware_geometry_estimate(reason='imu')
+
+    def on_hardware_laser_data(self, distance_m):
+        try:
+            distance_m = float(distance_m)
+        except Exception:
+            return
+        if distance_m <= 0:
+            return
+        self.hardware_distance_m = distance_m
+        self.hardware_distance_label.setText(f'激光距离：{distance_m:.3f} m / {distance_m * 1000.0:.1f} mm')
+        if hasattr(self, 'hardware_laser_health_label'):
+            self.hardware_laser_health_label.setText(f'激光：在线，{distance_m:.3f} m / {distance_m * 1000.0:.1f} mm')
+        try:
+            self.last_laser_distance_mm = distance_m * 1000.0
+            if hasattr(self, 'laser_distance_label'):
+                self.laser_distance_label.setText(f'激光距离：{distance_m:.3f} m / {self.last_laser_distance_mm:.1f} mm')
+        except Exception:
+            pass
+        self.update_hardware_geometry_estimate(reason='laser')
+
+    def new_hardware_session(self):
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        root = Path(self.filepath) / str(getattr(self.config, 'hardware_session_subdir', 'hardware_sessions'))
+        session_dir = root / f'pose_laser_{timestamp}'
+        try:
+            if getattr(self.hardware_recorder, 'isRunning', lambda: False)():
+                self.hardware_recorder.stop_thread()
+            self.hardware_recorder.set_session(session_dir)
+            self.hardware_recorder.start_thread()
+            self.hardware_session_dir = session_dir
+            self.hardware_frame_counter = 0
+            self.hardware_frame_count_label.setText('已采集：0 帧')
+            self.hardware_session_label.setText(f'硬件会话：{session_dir}')
+            self.hardware_trajectory_widget.clear_records()
+            self.append_runtime_event(f'硬件采集会话已创建：{session_dir}', level='ok')
+        except Exception as exc:
+            QMessageBox.critical(self, '创建失败', f'硬件采集会话创建失败：{exc}')
+
+    def _select_hardware_capture_frame(self):
+        mode = str(getattr(self.config, 'hardware_capture_frame_source', 'auto'))
+        candidates = []
+        if mode == 'camera_b':
+            candidates = [('camera_b', getattr(self, 'frame_b', None))]
+        elif mode == 'camera_a':
+            candidates = [('camera_a', getattr(self, 'frame_a', None))]
+        elif mode == 'main':
+            candidates = [('main', self.latest_display_images.get('main') if hasattr(self, 'latest_display_images') else None)]
+        else:
+            candidates = [
+                ('camera_b', getattr(self, 'frame_b', None)),
+                ('camera_a', getattr(self, 'frame_a', None)),
+                ('main', self.latest_display_images.get('main') if hasattr(self, 'latest_display_images') else None),
+            ]
+        for source, frame in candidates:
+            if isinstance(frame, np.ndarray) and frame.size > 0:
+                return source, np.ascontiguousarray(frame).copy()
+        return '', None
+
+    def hardware_capture_current_frame(self, is_auto=False):
+        source, frame = self._select_hardware_capture_frame()
+        if frame is None:
+            if not is_auto:
+                QMessageBox.information(self, '提示', '当前没有可采集的相机帧，请先打开普通相机B或工业相机A。')
+            return
+        if self.hardware_session_dir is None:
+            self.new_hardware_session()
+            if self.hardware_session_dir is None:
+                return
+        self.hardware_frame_counter += 1
+        frame_id = f'frame_{self.hardware_frame_counter:06d}'
+        sensor = dict(getattr(self, 'hardware_pose_data', {}) or {})
+        distance_m = float(getattr(self, 'hardware_distance_m', 0.0) or 0.0)
+        if distance_m <= 0 and getattr(self, 'last_laser_distance_mm', None):
+            distance_m = float(self.last_laser_distance_mm) / 1000.0
+        center = calculate_center_point_from_pose(sensor, distance_m)
+        geometry = estimate_camera_geometry_from_pose(
+            frame_shape=frame.shape,
+            distance_m=distance_m,
+            sensor_data=sensor,
+            hfov_deg=float(getattr(self.config, 'camera_horizontal_fov_deg', 60.0)),
+            vfov_deg=float(getattr(self.config, 'camera_vertical_fov_deg', 40.0)),
+        )
+        self.hardware_geometry_estimate = geometry
+        self.update_hardware_geometry_estimate(reason='capture')
+        camera_pos = (float(sensor.get('x', 0.0) or 0.0), float(sensor.get('y', 0.0) or 0.0), float(sensor.get('z', 0.0) or 0.0))
+        angles = (float(sensor.get('roll', 0.0) or 0.0), float(sensor.get('pitch', 0.0) or 0.0), float(sensor.get('yaw', 0.0) or 0.0))
+        try:
+            self.hardware_trajectory_widget.add_record(frame_id, frame, camera_pos, center, distance_m, angles)
+        except Exception:
+            pass
+        self.hardware_recorder.enqueue({
+            'frame_id': frame_id,
+            'timestamp': time.time(),
+            'source': source,
+            'frame': frame,
+            'sensor': sensor,
+            'distance_m': distance_m,
+            'center': center,
+            'geometry': geometry,
+        })
+        self.hardware_frame_count_label.setText(f'已采集：{self.hardware_frame_counter} 帧')
+        scale_txt = ''
+        if isinstance(geometry, dict) and geometry.get('ok'):
+            scale_txt = f" | {float(geometry.get('mm_per_px_x', 0.0)):.4f} mm/px"
+        self.append_runtime_event(f"{'自动' if is_auto else '手动'}硬件采集：{frame_id} | {source} | 距离 {distance_m:.3f} m{scale_txt}", level='ok')
+
+    def toggle_hardware_auto_capture(self):
+        if not self.hardware_auto_capture_enabled:
+            try:
+                interval = max(0.1, float(self.hardware_auto_interval_input.text().strip() or 1.0))
+            except Exception:
+                interval = 1.0
+                self.hardware_auto_interval_input.setText('1.0')
+            self.config.hardware_auto_capture_interval_s = interval
+            self.save_system_config()
+            if self.hardware_session_dir is None:
+                self.new_hardware_session()
+            self.hardware_auto_capture_enabled = True
+            self.hardware_auto_capture_timer.start(int(interval * 1000))
+            self.hardware_auto_capture_btn.setText('停止自动采集')
+            self.append_runtime_event(f'硬件自动采集已启动，间隔 {interval:.2f} s。', level='ok')
+        else:
+            self.hardware_auto_capture_enabled = False
+            self.hardware_auto_capture_timer.stop()
+            self.hardware_auto_capture_btn.setText('启动自动采集')
+            self.append_runtime_event('硬件自动采集已停止。', level='info')
+
+    def on_hardware_session_saved(self, image_name):
+        self.hardware_session_label.setText(f'硬件会话：{self.hardware_session_dir} | 最近保存 {image_name}')
+
+    def stop_hardware_runtime(self):
+        try:
+            if self.hardware_auto_capture_timer.isActive():
+                self.hardware_auto_capture_timer.stop()
+        except Exception:
+            pass
+        for attr in ['hardware_imu_thread', 'hardware_laser_thread']:
+            worker = getattr(self, attr, None)
+            if worker is not None:
+                try:
+                    worker.stop_thread()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        try:
+            if self.hardware_recorder is not None:
+                self.hardware_recorder.stop_thread()
+        except Exception:
+            pass
+
     def build_model_config_tab(self):
         return self._wrap_scroll_page(self.model_config_content)
     def build_measurement_config_tab(self):
@@ -1417,6 +2539,9 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                 widget.setVisible(enable_a)
         if getattr(self, 'status_camera_a_card', None):
             self.status_camera_a_card['frame'].setVisible(enable_a)
+        for widget in [getattr(self, 'preview_mode_a_combo', None)]:
+            if widget is not None:
+                widget.setVisible(enable_a)
         if not enable_a and getattr(self, 'cameraA', None) is not None:
             try:
                 if bool(getattr(self.cameraA, 'isOpen', False)):
@@ -1429,6 +2554,11 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                 self.workspace_mode_combo.setCurrentText('总览四宫格')
                 self.workspace_mode_combo.blockSignals(False)
                 self.apply_workspace_mode('总览四宫格', save=False)
+        if getattr(self, 'control_panel_mode_combo', None) is not None:
+            try:
+                self.apply_control_panel_mode(self.control_panel_mode_combo.currentText(), save=False)
+            except Exception:
+                pass
         if save:
             self.save_system_config()
         self.refresh_config_summary()
@@ -1593,17 +2723,17 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         frame = QFrame()
         frame.setObjectName('statusCard')
         frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        frame.setMinimumHeight(86)
-        frame.setMaximumHeight(86)
+        frame.setMinimumHeight(60)
+        frame.setMaximumHeight(66)
         frame.setStyleSheet(
-            f"QFrame#statusCard {{background:#ffffff; border:1px solid #dfe7ef; border-left:4px solid {accent}; border-radius:10px;}}"
-            " QLabel[role='title'] {color:#64748b; font-size:12px; font-weight:600;}"
-            " QLabel[role='value'] {color:#0f172a; font-size:16px; font-weight:700;}"
-            " QLabel[role='subtitle'] {color:#475569; font-size:12px;}"
+            f"QFrame#statusCard {{background:#ffffff; border:1px solid #e2e8f0; border-left:4px solid {accent}; border-radius:14px;}}"
+            " QLabel[role='title'] {color:#64748b; font-size:11px; font-weight:700;}"
+            " QLabel[role='value'] {color:#0f172a; font-size:15px; font-weight:800;}"
+            " QLabel[role='subtitle'] {color:#475569; font-size:10px;}"
         )
         layout = QVBoxLayout()
-        layout.setSpacing(3)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(2)
+        layout.setContentsMargins(12, 9, 12, 9)
         title_label = QLabel(title)
         title_label.setProperty('role', 'title')
         value_label = QLabel('准备中')
@@ -1628,10 +2758,10 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         }
         accent, bg, value_color, subtitle_color = palette.get(state, palette['info'])
         card['frame'].setStyleSheet(
-            f"QFrame#statusCard {{background:{bg}; border:1px solid #dfe7ef; border-left:4px solid {accent}; border-radius:10px;}}"
-            " QLabel[role='title'] {color:#64748b; font-size:12px; font-weight:600;}"
-            f" QLabel[role='value'] {{color:{value_color}; font-size:16px; font-weight:700;}}"
-            f" QLabel[role='subtitle'] {{color:{subtitle_color}; font-size:12px;}}"
+            f"QFrame#statusCard {{background:{bg}; border:1px solid #e2e8f0; border-left:4px solid {accent}; border-radius:14px;}}"
+            " QLabel[role='title'] {color:#64748b; font-size:11px; font-weight:700;}"
+            f" QLabel[role='value'] {{color:{value_color}; font-size:15px; font-weight:800;}}"
+            f" QLabel[role='subtitle'] {{color:{subtitle_color}; font-size:11px;}}"
         )
     def _set_status_card(self, card, value, subtitle='', state='info'):
         if not card or bool(getattr(self, '_app_closing', False)):
@@ -2195,6 +3325,11 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self._set_status_card(self.status_save_card, last_save_value, last_save_subtitle, state=save_state)
         self._set_status_card(self.status_camera_a_card, cam_a_value, cam_a_subtitle, state=cam_a_state)
         self._set_status_card(self.status_camera_b_card, cam_b_value, cam_b_subtitle, state=cam_b_state)
+        if getattr(self, 'header_status_label', None) is not None:
+            try:
+                self.header_status_label.setText(f'{runtime} · 推理 {self.current_inference_fps:.1f} FPS · 普通相机 {cam_b_value}')
+            except Exception:
+                pass
     def _camera_a_status_summary(self):
         if not getattr(self, 'cameraA', None):
             return '未初始化', '工业相机控制器尚未创建', 'danger'
@@ -2397,7 +3532,14 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             widget = item.widget()
             if widget is not None:
                 widget.setParent(None)
+        enable_a = bool(getattr(self.config, 'enable_camera_a_module', False))
         for title, widget in self.control_panel_groups.items():
+            if title == '工业相机A' and not enable_a:
+                try:
+                    widget.setParent(None)
+                except Exception:
+                    pass
+                continue
             try:
                 widget.setParent(None)
             except Exception:
@@ -2565,6 +3707,23 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
         self.laser_enable_checkbox.toggled.connect(self.on_laser_enabled_toggled)
         self.measurement_mode_combo.currentTextChanged.connect(self.on_measurement_mode_changed)
         self.laser_unit_combo.currentTextChanged.connect(self.on_laser_unit_changed)
+        self.hardware_refresh_ports_btn.clicked.connect(lambda: (self.refresh_hardware_ports(initial=False), self.request_hardware_auto_detect(trigger='refresh', auto_connect=True, force=True)))
+        self.hardware_auto_detect_btn.clicked.connect(lambda: self.request_hardware_auto_detect(trigger='manual', auto_connect=True, force=True))
+        self.hardware_serial_diag_btn.clicked.connect(self.show_hardware_serial_diagnostics)
+        self.hardware_imu_connect_btn.clicked.connect(self.toggle_hardware_imu)
+        self.hardware_imu_zero_btn.clicked.connect(self.reset_hardware_imu_zero)
+        self.hardware_laser_connect_btn.clicked.connect(self.toggle_hardware_laser_stream)
+        self.hardware_new_session_btn.clicked.connect(self.new_hardware_session)
+        self.hardware_capture_btn.clicked.connect(lambda: self.hardware_capture_current_frame(is_auto=False))
+        self.hardware_auto_capture_btn.clicked.connect(self.toggle_hardware_auto_capture)
+        self.hardware_clear_traj_btn.clicked.connect(self.hardware_trajectory_widget.clear_records)
+        self.hardware_apply_geometry_btn.clicked.connect(self.apply_hardware_camera_geometry)
+        self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+        self.hardware_edit_camera_params_btn.clicked.connect(self.toggle_hardware_camera_param_manual_edit)
+        self.hardware_camera_param_source_combo.currentTextChanged.connect(lambda _text: self.update_camera_params_from_current_camera(auto=True, reason='source_changed'))
+        self.hardware_frame_source_combo.currentTextChanged.connect(self.on_hardware_frame_source_changed)
+        self.hardware_imu_baudrate_combo.currentTextChanged.connect(self.on_hardware_imu_baudrate_changed)
+        self.hardware_laser_baudrate_combo.currentTextChanged.connect(self.on_hardware_laser_baudrate_changed)
         self.max_fps_spin.valueChanged.connect(self.on_max_fps_changed)
         self.anti_shake_checkbox.toggled.connect(self.on_anti_shake_toggled)
         self.motion_threshold_spin.valueChanged.connect(self.on_motion_threshold_changed)
@@ -2581,6 +3740,29 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                 for key, value in raw.items():
                     if hasattr(config, key):
                         setattr(config, key, value)
+                if raw.get('ui_layout_revision') != 'P13-compact-auto-camera-params':
+                    config.ui_layout_revision = 'P13-compact-auto-camera-params'
+                    config.ui_show_model_config_on_startup = False
+                    config.startup_choose_camera_mode = False
+                    config.enable_camera_a_module = False
+                    config.enable_camera_b_module = True
+                    config.ui_workspace_mode = 'overview'
+                    config.ui_control_panel_mode = 'compact'
+                    config.ui_show_event_log = False
+                    config.ui_restore_window_geometry = False
+                    config.ui_window_width = 0
+                    config.ui_window_height = 0
+                    config.ui_window_x = -1
+                    config.ui_window_y = -1
+                    config.hardware_imu_enabled = True
+                    config.hardware_imu_auto_connect = True
+                    config.hardware_laser_stream_enabled = True
+                    config.hardware_laser_stream_auto_connect = True
+                    config.hardware_imu_port = ''
+                    config.hardware_laser_stream_port = ''
+                    config.hardware_camera_param_source = 'auto'
+                    config.hardware_camera_params_auto_read = True
+                    config.hardware_camera_params_manual_edit = False
             except Exception as exc:
                 print(f'加载系统配置失败: {exc}')
         self.save_system_config(config)
@@ -3302,36 +4484,49 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                 return None
         return self.last_laser_distance_mm
     def estimate_mm_per_pixel_by_laser(self, frame_shape):
-        if self.last_laser_distance_mm is None or self.last_laser_distance_mm <= 0:
+        """Estimate mm/px from the integrated laser + six-axis + camera model."""
+        distance_mm = None
+        if getattr(self, 'last_laser_distance_mm', None) is not None and self.last_laser_distance_mm > 0:
+            distance_mm = float(self.last_laser_distance_mm)
+        elif float(getattr(self, 'hardware_distance_m', 0.0) or 0.0) > 0:
+            distance_mm = float(self.hardware_distance_m) * 1000.0
+        if distance_mm is None or distance_mm <= 0:
             return None
         if not frame_shape or len(frame_shape) < 2:
             return None
-        width_px = float(frame_shape[1])
-        if width_px <= 0:
-            return None
         try:
             hfov_deg = float(self.config.camera_horizontal_fov_deg)
+            vfov_deg = float(getattr(self.config, 'camera_vertical_fov_deg', 0.0) or 0.0)
         except Exception:
             return None
-        if hfov_deg <= 0 or hfov_deg >= 179:
+        estimate = estimate_camera_geometry_from_pose(
+            frame_shape=frame_shape,
+            distance_m=distance_mm / 1000.0,
+            sensor_data=getattr(self, 'hardware_pose_data', {}) or {},
+            hfov_deg=hfov_deg,
+            vfov_deg=vfov_deg,
+        )
+        if not estimate.get('ok'):
             return None
-        scene_width_mm = 2.0 * float(self.last_laser_distance_mm) * np.tan(np.deg2rad(hfov_deg / 2.0))
-        if scene_width_mm <= 0:
-            return None
-        return float(scene_width_mm / width_px)
+        self.hardware_geometry_estimate = estimate
+        # Crack width is a transverse measurement; horizontal scale is generally the
+        # most stable estimate when only a single scalar width is available.
+        return float(estimate.get('mm_per_px_x') or estimate.get('mm_per_px_avg') or 0.0)
+
     def resolve_measurement_mm(self, pixel_width, frame_shape=None):
         calibration_mpp = float(self.mm_per_pixel) if self.mm_per_pixel and self.mm_per_pixel > 0 else None
-        laser_mpp = self.estimate_mm_per_pixel_by_laser(frame_shape) if self.config.laser_enabled else None
+        has_hardware_distance = float(getattr(self, 'hardware_distance_m', 0.0) or 0.0) > 0 or bool(getattr(self, 'last_laser_distance_mm', None))
+        laser_mpp = self.estimate_mm_per_pixel_by_laser(frame_shape) if (self.config.laser_enabled or has_hardware_distance) else None
         chosen_mpp = None
         source = '未标定'
         mode = self.measurement_mode_combo.currentText() if hasattr(self, 'measurement_mode_combo') else self.config.measurement_mode
         if mode == 'laser_only':
             chosen_mpp = laser_mpp
-            source = '激光估算' if chosen_mpp else '未获取激光距离'
+            source = '激光+六轴估算' if chosen_mpp else '未获取激光距离'
         elif mode == 'laser_first':
             if laser_mpp is not None:
                 chosen_mpp = laser_mpp
-                source = '激光估算'
+                source = '激光+六轴估算'
             elif calibration_mpp is not None:
                 chosen_mpp = calibration_mpp
                 source = '标定换算'
@@ -3344,14 +4539,14 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
                 source = '标定换算'
             elif laser_mpp is not None:
                 chosen_mpp = laser_mpp
-                source = '激光估算'
+                source = '激光+六轴估算'
         else:
             if calibration_mpp is not None:
                 chosen_mpp = calibration_mpp
                 source = '标定换算'
             elif laser_mpp is not None:
                 chosen_mpp = laser_mpp
-                source = '激光估算'
+                source = '激光+六轴估算'
         self.latest_estimated_mm_per_pixel = chosen_mpp
         self.current_measurement_source = source
         if chosen_mpp is None:
@@ -3749,6 +4944,10 @@ class CameraGUI(ModelRuntimeMixin, RealtimeProcessingMixin, CameraFlowMixin, QWi
             self.is_running_b = False
             self.PictureDeal_is_running = False
             try:
+                self.stop_hardware_runtime()
+            except Exception:
+                pass
+            try:
                 self.toggle_camera_a(True)
             except Exception:
                 pass
@@ -3806,24 +5005,178 @@ if __name__ == "__main__":
     # 设置全局样式
     app.setStyleSheet("""
         QWidget {
-            font-family: 'Microsoft YaHei', 'SimHei', sans-serif;
-            font-size: 14px;
+            font-family: 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', sans-serif;
+            font-size: 13px;
+            color: #1e293b;
+        }
+        QWidget#CameraGUIRoot {
+            background: #f4f7fb;
         }
         QLabel {
-            color: #333;
+            color: #334155;
+        }
+        QLabel#headerTitle {
+            color: #ffffff;
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+        }
+        QLabel#headerSubtitle {
+            color: #c7d2fe;
+            font-size: 12px;
+        }
+        QLabel#headerPill {
+            color: #e0f2fe;
+            background: rgba(15, 23, 42, 0.28);
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            border-radius: 14px;
+            padding: 4px 10px;
+            font-weight: 700;
+        }
+        QLabel#toolbarCaption {
+            color: #64748b;
+            font-weight: 700;
+        }
+        QFrame#topHeader {
+            border-radius: 12px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0f172a, stop:0.58 #1d4ed8, stop:1 #0f766e);
+        }
+        QFrame#modernToolbar {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+        }
+        QGroupBox {
+            color: #0f172a;
+        }
+        QScrollArea {
+            border: none;
+            background: transparent;
+        }
+        QSplitter::handle {
+            background: #dbe4ef;
+            border-radius: 2px;
+        }
+        QSplitter::handle:horizontal {
+            width: 6px;
+        }
+        QSplitter::handle:vertical {
+            height: 6px;
+        }
+        QTabWidget::pane {
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            background: #ffffff;
+            top: -1px;
+        }
+        QTabBar::tab {
+            background: #f8fafc;
+            color: #475569;
+            border: 1px solid #e2e8f0;
+            padding: 8px 14px;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+            margin-right: 4px;
+            font-weight: 600;
+        }
+        QTabBar::tab:selected {
+            background: #ffffff;
+            color: #1d4ed8;
+            border-bottom-color: #ffffff;
+        }
+        QPushButton {
+            background: #ffffff;
+            color: #1e293b;
+            border: 1px solid #cbd5e1;
+            border-radius: 9px;
+            padding: 6px 10px;
+            font-weight: 700;
+        }
+        QPushButton:hover {
+            background: #f8fafc;
+            border-color: #94a3b8;
+        }
+        QPushButton:pressed {
+            background: #e2e8f0;
+        }
+        QPushButton:disabled {
+            background: #f1f5f9;
+            color: #94a3b8;
+            border-color: #e2e8f0;
+        }
+        QPushButton[variant="primary"] {
+            background: #2563eb;
+            color: #ffffff;
+            border-color: #2563eb;
+        }
+        QPushButton[variant="primary"]:hover {
+            background: #1d4ed8;
+            border-color: #1d4ed8;
+        }
+        QPushButton[variant="success"] {
+            background: #059669;
+            color: #ffffff;
+            border-color: #059669;
+        }
+        QPushButton[variant="success"]:hover {
+            background: #047857;
+            border-color: #047857;
+        }
+        QPushButton[variant="chip"] {
+            background: #f8fafc;
+            color: #475569;
+            border-radius: 16px;
+            padding: 6px 12px;
+        }
+        QPushButton[variant="chip"]:checked {
+            background: #dbeafe;
+            color: #1d4ed8;
+            border-color: #93c5fd;
+        }
+        QComboBox, QLineEdit, QSpinBox, QTextEdit {
+            background: #ffffff;
+            border: 1px solid #cbd5e1;
+            border-radius: 9px;
+            padding: 6px 9px;
+            selection-background-color: #bfdbfe;
+        }
+        QComboBox:hover, QLineEdit:hover, QSpinBox:hover {
+            border-color: #93c5fd;
+        }
+        QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QTextEdit:focus {
+            border: 1px solid #2563eb;
+        }
+        QCheckBox {
+            spacing: 8px;
+            color: #334155;
         }
         QSlider::groove:horizontal {
-            border: 1px solid #bbb;
-            background: white;
-            height: 10px;
+            border: none;
+            background: #dbe4ef;
+            height: 8px;
             border-radius: 4px;
         }
         QSlider::handle:horizontal {
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #eee, stop:1 #ccc);
-            border: 1px solid #777;
+            background: #2563eb;
+            border: 2px solid #ffffff;
             width: 18px;
-            margin: -4px 0;
-            border-radius: 8px;
+            margin: -6px 0;
+            border-radius: 9px;
+        }
+        QTableWidget {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            gridline-color: #e2e8f0;
+            selection-background-color: #dbeafe;
+        }
+        QHeaderView::section {
+            background: #f8fafc;
+            color: #334155;
+            border: none;
+            border-bottom: 1px solid #e2e8f0;
+            padding: 8px;
+            font-weight: 700;
         }
     """)
     window = CameraGUI()

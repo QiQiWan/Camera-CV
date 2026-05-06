@@ -34,3 +34,84 @@ Current thread 0x00002250 (most recent call first):
 
 Thread 0x00008500 (most recent call first):
   File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3593 in <module>
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
+[sys.excepthook] Traceback (most recent call last):
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 3720, in <lambda>
+    self.hardware_read_camera_params_btn.clicked.connect(lambda: self.update_camera_params_from_current_camera(auto=False, reason='manual'))
+                                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\OneDrive\python\research\CrackRecognizition\new_code\crack_detection_app.py", line 2142, in update_camera_params_from_current_camera
+    hfov_calc = math.degrees(2.0 * math.atan(scene_w_mm / (2.0 * distance_mm)))
+                ^^^^
+NameError: name 'math' is not defined. Did you mean: 'Path'? Or did you forget to import 'math'
+
