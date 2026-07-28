@@ -17,6 +17,7 @@ from skimage.filters import threshold_otsu
 from skimage.morphology import skeletonize
 
 from app_core.shared import DetectionResult
+from app_core.wireless_gateway import crop_stitched_frame_for_camera
 
 
 class CameraFlowMixin:
@@ -198,6 +199,11 @@ class CameraFlowMixin:
 
     def _stop_camera_b_stream(self, clear_ui=False):
         self.is_running_b = False
+        if hasattr(self, 'stop_wireless_sensor_polling'):
+            try:
+                self.stop_wireless_sensor_polling()
+            except Exception:
+                pass
         self._next_camera_b_session_id()
         with self.camera_b_lock:
             cap = self.camera_b
@@ -411,6 +417,16 @@ class CameraFlowMixin:
 
     def toggle_camera_b(self, flag=False):
         if self.open_close_b_btn.text() == "▶️ 打开设备" and flag is False:
+            wireless_mode = bool(getattr(self, 'is_camera_b_wireless_mode', lambda: False)())
+            if wireless_mode and hasattr(self, 'populate_wireless_camera_b_devices'):
+                self.populate_wireless_camera_b_devices()
+                try:
+                    selected_id = 1 if self.camera_b_combo_box.currentIndex() == 1 else 0
+                    self.config.wireless_camera_id = selected_id
+                    self.config.wireless_gateway_url = self.wireless_gateway_base_url()
+                    self.save_system_config()
+                except Exception:
+                    pass
             current_index = self.camera_b_combo_box.currentData()
             if current_index is None:
                 current_index = self.camera_b_combo_box.currentText().strip()
@@ -434,6 +450,8 @@ class CameraFlowMixin:
                 self._next_camera_b_session_id()
                 self.capture_b_btn.setEnabled(False)
                 self.save_b_btn.setEnabled(False)
+                if wireless_mode and hasattr(self, 'stop_wireless_sensor_polling'):
+                    self.stop_wireless_sensor_polling()
             else:
                 self.current_device_index = current_index
                 self._configure_camera_b_capture(cap, backend)
@@ -453,15 +471,19 @@ class CameraFlowMixin:
                 self._camera_b_capture_guard_depth = 0
                 self._camera_b_reconnect_pending = False
                 self._camera_b_reconnect_attempts = 0
-                self.camera_b_display.setText(f"相机B已开启 ({self.backend_name(self.current_camera_b_backend)})")
+                mode_label = "无线网关" if wireless_mode else self.backend_name(self.current_camera_b_backend)
+                self.camera_b_display.setText(f"相机B已开启 ({mode_label})")
                 self.is_running_b = True
                 session_id = self._next_camera_b_session_id()
                 self.video_thread_b = threading.Thread(target=self.video_loop_b, args=(session_id,), daemon=True)
                 self.video_thread_b.start()
-                try:
-                    self.ensure_hardware_auto_connected(trigger='camera_b_open')
-                except Exception:
-                    pass
+                if wireless_mode and hasattr(self, 'start_wireless_sensor_polling'):
+                    self.start_wireless_sensor_polling()
+                else:
+                    try:
+                        self.ensure_hardware_auto_connected(trigger='camera_b_open')
+                    except Exception:
+                        pass
         else:
             self._stop_camera_b_stream(clear_ui=True)
             self.open_close_b_btn.setText("▶️ 打开设备")
@@ -506,6 +528,11 @@ class CameraFlowMixin:
                     self.camera_b_read_failures = 0
                     self.camera_b_last_frame_ts = time.time()
                     self._push_fps_timestamp(self.preview_fps_timestamps)
+                    if bool(getattr(self, 'is_camera_b_wireless_mode', lambda: False)()):
+                        safe_frame = crop_stitched_frame_for_camera(
+                            safe_frame,
+                            camera_id=int(getattr(self.config, 'wireless_camera_id', 0) or 0),
+                        )
                     raw_frame = self.normalize_frame_orientation(safe_frame)
                     self.frame_b = raw_frame.copy()
                     use_preview_stab = bool(getattr(self.config, 'anti_shake_enabled', False) and getattr(self.config, 'anti_shake_preview_enabled', False))
@@ -838,6 +865,19 @@ class CameraFlowMixin:
 
 
     def find_devices_b(self):
+        if bool(getattr(self, 'is_camera_b_wireless_mode', lambda: False)()):
+            try:
+                self.populate_wireless_camera_b_devices()
+                self.find_b_btn.setEnabled(True)
+                self.open_close_b_btn.setEnabled(True)
+                try:
+                    self.diagnose_b_btn.setEnabled(False)
+                except Exception:
+                    pass
+                return
+            except Exception as exc:
+                self.camera_b_display.setText(f"无线网关配置失败: {exc}")
+                return
         if self.device_search_busy_b:
             return
         self.device_search_force_refresh_b = True

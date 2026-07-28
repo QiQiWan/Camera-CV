@@ -157,6 +157,10 @@ class SystemConfig:
     camera_b_open_validation_reads: int = 1
     camera_b_close_join_timeout_ms: int = 220
     camera_b_open_warmup_ms: int = 0
+    wireless_gateway_url: str = 'http://10.42.0.1:8000'
+    wireless_camera_id: int = 0
+    wireless_sensor_poll_ms: int = 250
+    wireless_gateway_ws_port: int = 8765
     camera_a_close_join_timeout_ms: int = 220
     camera_a_capture_pause_camera_b: bool = False
     camera_a_capture_temp_name: str = 'temp_cam_a.jpg'

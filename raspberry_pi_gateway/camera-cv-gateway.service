@@ -1,0 +1,14 @@
+[Unit]
+Description=Camera-CV Raspberry Pi acquisition gateway
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/eatrice/kewang/raspberry_pi_gateway
+ExecStart=/home/eatrice/cv_env/bin/python -m pi_gateway.main --config /home/eatrice/kewang/raspberry_pi_gateway/pi_gateway_config.json
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

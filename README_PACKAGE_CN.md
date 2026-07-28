@@ -75,3 +75,11 @@
 - 位姿激光采集面板新增“读取当前相机参数”，优先读取当前帧分辨率、FPS、曝光、焦点、变焦等驱动可提供信息。
 - HFOV/VFOV 默认锁定，由当前图像、已有标定比例和激光距离自动估计；只有需要人工修正时才点击“手动修正”。
 - 说明文档：`docs/ui_compact_camera_params_cn.md`。
+
+
+## 树莓派无线采集网关
+
+- 新增 `raspberry_pi_gateway/`：树莓派 Zero 2W 可开机创建 NetworkManager 热点，采集双目 USB 摄像头、激光和 IMU。
+- USB 双目摄像头按 `/dev/video0` 拼接帧读取，树莓派原样转发 `/video/full.mjpg`，PC 端按左/右选择裁剪。
+- PC 端普通相机 B 选择“无线”后，可连接 `http://10.42.0.1:8000` 网关并选择左/右镜头。
+- 说明文档：`docs/pi_wireless_gateway_cn.md`。

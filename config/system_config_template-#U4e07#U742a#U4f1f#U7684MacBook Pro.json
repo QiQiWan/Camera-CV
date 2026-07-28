@@ -55,10 +55,6 @@
   "patrol_min_stable_frames": 4,
   "patrol_similarity_downsample": 16,
   "camera_b_display_interval_ms": 33,
-  "wireless_gateway_url": "http://10.42.0.1:8000",
-  "wireless_camera_id": 0,
-  "wireless_sensor_poll_ms": 250,
-  "wireless_gateway_ws_port": 8765,
   "anti_shake_preview_enabled": false,
   "anti_shake_preview_strength": 0.84,
   "anti_shake_preview_max_shift_px": 96.0,
@@ -104,12 +100,9 @@
   "ui_window_height": 0,
   "ui_window_x": -1,
   "ui_window_y": -1,
-  "ui_layout_revision": "P13-compact-auto-camera-params",
+  "ui_layout_revision": "P11-modern-workbench",
   "app_display_name": "视觉检测仪智能测量系统",
   "hardware_geometry_auto_update": true,
   "hardware_geometry_warn_tilt_deg": 30.0,
-  "hardware_geometry_use_current_camera_frame": true,
-  "hardware_camera_param_source": "auto",
-  "hardware_camera_params_auto_read": true,
-  "hardware_camera_params_manual_edit": false
+  "hardware_geometry_use_current_camera_frame": true
 }

@@ -1,0 +1,38 @@
+{
+  "ap": {
+    "enabled": true,
+    "ssid": "CameraCV-Pi",
+    "password": "88888888",
+    "interface": "wlan0",
+    "address": "10.42.0.1",
+    "prefix": 24,
+    "connection_name": "CameraCV-Pi-AP",
+    "channel": 6
+  },
+  "camera": {
+    "enabled": true,
+    "mode": "mjpeg_relay",
+    "device": "/dev/video0",
+    "width": 1280,
+    "height": 480,
+    "fps": 15,
+    "fourcc": "MJPG",
+    "stream_mmap": 3
+  },
+  "laser": {
+    "port": "/dev/serial0",
+    "baudrate": 230400,
+    "frame_size": 195,
+    "header_byte": 170
+  },
+  "imu": {
+    "port": "/dev/ttyUSB0",
+    "baudrate": 115200
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "http_port": 8000,
+    "ws_port": 8765,
+    "sensor_publish_hz": 10
+  }
+}
